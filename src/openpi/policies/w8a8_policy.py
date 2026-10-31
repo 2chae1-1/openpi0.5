@@ -123,6 +123,26 @@ def load_w8a8_policy(
     model.paligemma_with_expert.to_bfloat16_for_selected_params("bfloat16")
     replace_w8a8_layers(model, names)
     state = load_file(str(pathlib.Path(checkpoint_dir) / "model.safetensors"), device="cpu")
+
+    # Remove only known non-persistent positional buffers.
+    optional_buffers = (
+        "paligemma_with_expert.gemma_expert.model.rotary_emb.inv_freq",
+        "paligemma_with_expert.paligemma.model.language_model.rotary_emb.inv_freq",
+        "paligemma_with_expert.paligemma.model.vision_tower.vision_model.embeddings.position_ids",
+    )
+    for key in optional_buffers:
+        state.pop(key, None)
+
+    # Restore the missing tied lm_head key from its shared embedding.
+    lm_head_key = "paligemma_with_expert.paligemma.lm_head.weight"
+    embedding_key = (
+        "paligemma_with_expert.paligemma.model.language_model.embed_tokens.weight"
+    )
+    if lm_head_key not in state:
+        if embedding_key not in state:
+            raise ValueError(f"Missing tied embedding: {embedding_key}")
+        state[lm_head_key] = state[embedding_key]
+
     validate_state_dict(model, state, names)
     model.load_state_dict(state, strict=True)
     del state
