@@ -1,4 +1,4 @@
-"""Load official pi05_libero PyTorch weights, then physically prune expert FFNs.
+"""Load official pi05_libero PyTorch weights, then prune selected gated FFNs.
 
 Run from the repository root: python -m pruning.run_structured_ffn --help
 Only the original dense model is accepted; no quantization or training is used.
@@ -23,6 +23,7 @@ import torch
 
 from pruning.lm_head_audit import lm_head_metrics
 from pruning.lm_head_audit import observe_lm_head_calls
+from pruning.structured_ffn import estimate_pi05_ffn_reduction
 from pruning.structured_ffn import prepare_pi05_pruned_shapes
 from pruning.structured_ffn import prune_pi05_ffns
 
@@ -113,10 +114,12 @@ def load_original_bf16(checkpoint_dir: str):
     model.paligemma_with_expert.to_bfloat16_for_selected_params("bfloat16")
     model.eval()
     # Protect the requested source precision and avoid accidentally pruning W8A8.
-    for layer in model.paligemma_with_expert.gemma_expert.model.layers:
-        for projection in (layer.mlp.gate_proj, layer.mlp.up_proj, layer.mlp.down_proj):
-            if not isinstance(projection, torch.nn.Linear) or projection.weight.dtype != torch.bfloat16:
-                raise TypeError("Expected original dense BF16 Action Expert FFN weights.")
+    root = model.paligemma_with_expert
+    for layers in (root.gemma_expert.model.layers, root.paligemma.language_model.layers):
+        for layer in layers:
+            for projection in (layer.mlp.gate_proj, layer.mlp.up_proj, layer.mlp.down_proj):
+                if not isinstance(projection, torch.nn.Linear) or projection.weight.dtype != torch.bfloat16:
+                    raise TypeError("Expected original dense BF16 Action Expert and Language Backbone FFN weights.")
     return model, config, resolved
 
 
@@ -124,7 +127,11 @@ def parameter_metrics(model: torch.nn.Module) -> dict:
     """Count unique parameters and their actual dtype-dependent tensor storage."""
     def count(parameters):
         result = {"parameters": 0, "weight_bytes": 0, "by_dtype": {}}
+        seen = set()
         for parameter in parameters:
+            if id(parameter) in seen:
+                continue
+            seen.add(id(parameter))
             elements = parameter.numel()
             size = elements * parameter.element_size()
             result["parameters"] += elements
@@ -135,12 +142,16 @@ def parameter_metrics(model: torch.nn.Module) -> dict:
         result["weight_mib"] = result["weight_bytes"] / 1024**2
         return result
 
-    layers = model.paligemma_with_expert.gemma_expert.model.layers
+    root = model.paligemma_with_expert
+    expert_layers = root.gemma_expert.model.layers
+    language_layers = root.paligemma.language_model.layers
     return {
         "model": count(model.parameters()),
-        "action_expert_ffn": count(p for layer in layers for p in layer.mlp.parameters()),
+        "action_expert_ffn": count(p for layer in expert_layers for p in layer.mlp.parameters()),
+        "language_ffn": count(p for layer in language_layers for p in layer.mlp.parameters()),
         "action_expert_lm_head": lm_head_metrics(model),
-        "expert_intermediate_sizes": [layer.mlp.gate_proj.out_features for layer in layers],
+        "expert_intermediate_sizes": [layer.mlp.gate_proj.out_features for layer in expert_layers],
+        "language_intermediate_sizes": [layer.mlp.gate_proj.out_features for layer in language_layers],
     }
 
 
@@ -244,10 +255,13 @@ def run(args: argparse.Namespace) -> tuple[dict, int]:
         "config_name": CONFIG_NAME,
         "checkpoint_dir": args.checkpoint_dir,
         "device": args.device,
+        "target": args.target,
         "requested_prune_fraction": args.prune_fraction,
         "multiple_of": args.multiple_of,
         "before": None,
         "after": None,
+        "ten_percent_projection": None,
+        "per_target": None,
         "outputs": {
             "before": {"status": "unverified", "shape": None},
             "after": {"status": "unverified", "shape": None},
@@ -270,8 +284,8 @@ def run(args: argparse.Namespace) -> tuple[dict, int]:
         },
         "memory_definition": "Unique parameter numel * element_size; excludes buffers, activations, KV cache and allocator overhead.",
         "notes": ["Training-free weight-magnitude heuristic; no calibration, gradients or fine-tuning.",
-                  "Magnitude pruning is the baseline; only Action Expert gated FFN intermediate channels are removed.",
-                  "Action Expert lm_head is retained; usage observations apply only to each sampled forward.",
+                  "Magnitude pruning is the baseline; only selected expert/language gated FFN intermediate channels are removed.",
+                  "All lm_head modules are retained; Action Expert head usage observations apply only to each sampled forward.",
                   "Output shapes are raw model actions, before LIBERO policy postprocessing."],
     }
     exit_code = 2
@@ -286,6 +300,13 @@ def run(args: argparse.Namespace) -> tuple[dict, int]:
         report["resolved_checkpoint_dir"] = str(resolved)
         report["verification"]["original_checkpoint_loaded"] = True
         report["before"] = parameter_metrics(model)
+        report["ten_percent_projection"] = {
+            "basis": "shape_based_projection_not_compression_measurement",
+            "requested_prune_fraction": 0.10,
+            "multiple_of": args.multiple_of,
+            "model_parameters_before": report["before"]["model"]["parameters"],
+            **estimate_pi05_ffn_reduction(model, keep_fraction=0.9, multiple_of=args.multiple_of),
+        }
         device = torch.device(args.device)
         inputs = None
         if not args.skip_forward:
@@ -302,11 +323,19 @@ def run(args: argparse.Namespace) -> tuple[dict, int]:
                 if device.type == "cuda":
                     torch.cuda.empty_cache()
         stage = "physical_pruning"
-        manifest = prune_pi05_ffns(model, target="expert", keep_fraction=1 - args.prune_fraction, multiple_of=args.multiple_of)
+        manifest = prune_pi05_ffns(model, target=args.target, keep_fraction=1 - args.prune_fraction, multiple_of=args.multiple_of)
         report["verification"]["physical_pruning"] = True
         report["after"] = parameter_metrics(model)
         report["parameters_removed"] = manifest["parameters_removed"]
+        report["model_parameter_reduction_pct"] = manifest["model_parameter_reduction_pct"]
         report["weight_bytes_removed"] = report["before"]["model"]["weight_bytes"] - report["after"]["model"]["weight_bytes"]
+        report["per_target"] = manifest["per_target"]
+        for part, metrics in report["per_target"].items():
+            metric_key = "action_expert_ffn" if part == "expert" else "language_ffn"
+            metrics["weight_bytes_removed"] = (
+                report["before"][metric_key]["weight_bytes"] - report["after"][metric_key]["weight_bytes"]
+            )
+            metrics["weight_mib_removed"] = metrics["weight_bytes_removed"] / 1024**2
         for layer in manifest["layers"]:
             layer["actual_prune_fraction"] = layer["removed_channels"] / layer["original_intermediate"]
         report["layers"] = manifest["layers"]
@@ -377,6 +406,8 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--checkpoint-dir", required=True, help="Local or remote directory containing original dense model.safetensors.")
     parser.add_argument("--output-dir", required=True, help="New directory for report, manifest and compact state_dict.")
     parser.add_argument("--device", default="cuda", help="cuda, cuda:N or cpu; BF16 weights are retained on CPU.")
+    parser.add_argument("--target", choices=("expert", "language", "both"), default="expert",
+                        help="FFNs to prune: Action Expert (default), Language Backbone, or both.")
     parser.add_argument("--prune-fraction", type=float, default=0.10)
     parser.add_argument("--multiple-of", type=int, default=1, help="Retained FFN width alignment; actual ratio is reported.")
     parser.add_argument("--batch-size", type=int, default=1)
