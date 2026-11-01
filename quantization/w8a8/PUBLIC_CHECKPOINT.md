@@ -213,3 +213,220 @@ Jetson Orin ARM64/SM87 호환성과 성능. 공개 모델 문서의 성능 수�
 작업 시작 전부터 존재한 `export_cpu.py`, `test_validation.py`, alias helper 및
 forward 검증 스크립트의 미커밋 작업은 보존했다. 기존 BitBLAS 계층 구현과
 `targets_pi05_libero_candidate.json`은 이번에 수정하지 않았다.
+
+## FP 대 공개 W8A8 추론 벤치마크 (GPU 서버 전용, 실제 측정 미실행)
+
+`scripts/benchmark_pi05_fp_w8a8.py`는 위의 헤더 → strict load → INT8 커널 →
+`policy.infer()` 검사가 끝난 뒤 실행한다. 준비된 모델을 비교하며 재양자화·재학습·Pruning을
+수행하지 않는다. 아래의 다운로드·공식 변환·모델 로딩·벤치마크는 **Linux GPU 서버에서만**
+수행한다. Windows에서 전체 가중치를 내려받거나 CUDA/BitBLAS를 실행한 결과가 아니다.
+
+### 공식 FP 로딩 경로와 형식 조건
+
+공식 FP 경로는 `config.get_config("pi05_libero")`와
+`policy_config.create_trained_policy(config, checkpoint_dir)`다. 공식 설정은 π0.5,
+action horizon 10, padded action dimension 32이며 LIBERO 정책 출력은 `(10, 7)`이다.
+`scripts/serve_policy.py`의 LIBERO 기본 checkpoint는
+`gs://openpi-assets/checkpoints/pi05_libero`다.
+
+- [공식 LIBERO checkpoint 안내](https://github.com/Physical-Intelligence/openpi/blob/main/examples/libero/README.md)
+  와 [공식 PyTorch 안내 및 변환 절차](https://github.com/Physical-Intelligence/openpi#pytorch-support)를 확인했다.
+- [공식 policy_config.py](https://github.com/Physical-Intelligence/openpi/blob/main/src/openpi/policies/policy_config.py)는
+  루트에 `model.safetensors`가 있으면 PyTorch 로더를, 없으면 `params/`의 JAX 로더를 선택한다.
+  `pytorch_weight_path` 설정의 예시 문자열은 배포된 PyTorch 파일의 존재 증거가 아니다.
+- [공식 변환기](https://github.com/Physical-Intelligence/openpi/blob/main/examples/convert_jax_model_to_pytorch.py)는
+  이 저장소에도 `examples/convert_jax_model_to_pytorch.py`로 존재하며 JAX/Orbax를
+  `model.safetensors`로 저장한다. 새 변환기나 비공식 key 변환은 추가하지 않는다.
+- 이번 환경에서는 GCS 객체 목록에 접근하지 못했으므로 공식 원격 checkpoint에 현재
+  PyTorch 파일이 있는지는 **미확인**이다. 다운로드한 로컬 디렉터리의 실제 파일로 판정한다.
+  `params/`만 존재하는 FP를 PyTorch W8A8과 직접 속도 비교하지 않는다.
+
+벤치마크는 준비된 **로컬 디렉터리만** 받으며 자동 다운로드/변환을 하지 않는다.
+FP의 `model.safetensors`가 없거나 `--fp-checkpoint`를 생략하면 FP는 `not_run`으로 남기고
+W8A8 측정은 계속한다. 전체 비교는 미검증이며 speedup은 `null`, 종료 코드는 0이 아니다.
+준비되지 않은 FP를 JAX 경로로 대신 실행하지 않는다.
+
+### 서버 환경과 FP 준비
+
+앞 절의 OpenPI/Python 3.11 환경, PyTorch 2.7.1, Transformers 4.53.2 및 이 저장소의
+`transformers_replace`, safetensors, huggingface_hub, CUDA, BitBLAS/TVM을 사용한다.
+새 대형 의존성은 필요 없다. GPU의 BF16 및 BitBLAS INT8 지원, CUDA/toolkit/driver와
+BitBLAS 빌드 조합을 먼저 확인한다. 공개 모델 문서는 A40에서의 실행을 설명하지만
+이 저장소와 Jetson Orin ARM64/SM87에서의 실행 보증은 아니다. Orin 호환성은 후속 검증 사항이다.
+
+앞 절의 `CKPT`, `PYTHONPATH`, `JAX_PLATFORMS=cpu` 설정과 W8A8 다운로드/검사를 완료한
+같은 셸에서 다음을 실행한다. FP를 이미 공식 경로로 준비했다면 다운로드·변환 단계는
+건너뛰고 `FP`를 그 디렉터리로 설정한다.
+
+```bash
+# 저장소 루트, 활성화된 GPU 서버 Python 환경에서 실행
+set -euo pipefail
+export PYTHONPATH="$PWD/src:$PWD/packages/openpi-client/src${PYTHONPATH:+:$PYTHONPATH}"
+export JAX_PLATFORMS=cpu
+export FP=/srv/checkpoints/pi05_libero_pytorch
+export CKPT=/srv/checkpoints/pi05-libero-w8a8-public
+
+# 서버에서만 공식 checkpoint 다운로드. 전체 가중치와 assets가 포함된다.
+export FP_JAX="$(python - <<'PY'
+from openpi.shared import download
+print(download.maybe_download('gs://openpi-assets/checkpoints/pi05_libero'))
+PY
+)"
+
+if test -f "$FP_JAX/model.safetensors"; then
+  # 이미 공식 PyTorch 파일이 있다면 해당 디렉터리를 그대로 사용
+  export FP="$FP_JAX"
+elif test -d "$FP_JAX/params"; then
+  # 공식 변환기만 사용. 입력 경로에 pi05 이름을 유지한다.
+  test ! -e "$FP"
+  python examples/convert_jax_model_to_pytorch.py \
+    --checkpoint-dir "$FP_JAX" --config-name pi05_libero \
+    --output-path "$FP" --precision bfloat16
+
+  # 현재 변환기의 assets 탐색은 checkpoint의 부모를 보므로 직접 확인/복사한다.
+  # 가중치 변환이 아니라 원본 공식 정규화 자산의 보존이다.
+  test -f "$FP_JAX/assets/physical-intelligence/libero/norm_stats.json"
+  mkdir -p "$FP/assets"
+  cp -a "$FP_JAX/assets/." "$FP/assets/"
+else
+  echo "공식 FP checkpoint의 지원 형식을 확인할 수 없습니다" >&2
+  exit 1
+fi
+test -s "$FP/model.safetensors"
+test -f "$FP/assets/physical-intelligence/libero/norm_stats.json"
+```
+
+현재 공식 변환기에는 경로의 `pi05` 문자열을 검사하는 코드가 있어 입력 디렉터리 이름을
+임의로 바꾸지 않는다. 변환 자체의 수치 보존은 이번 Windows 작업에서 검증하지 않았다.
+변환 로그, 원본 checkpoint의 출처/객체 버전, 변환 시 Git SHA와 precision을 팀에서 보존한다.
+`--fp-revision`/`--w8a8-revision`은 사용자가 선언하는 provenance이며 로컬 가중치의 revision을
+자동 인증하는 기능이 아니다. 알 수 없는 revision을 임의로 채우지 않는다.
+
+### 복사해서 실행할 벤치마크 명령
+
+다른 GPU 작업을 중단하고, 앞 절의 `inspect_w8a8.py` 및 `validate_w8a8_forward.py`가
+통과한 뒤 실행한다. 출력 디렉터리는 새 경로 또는 비어 있는 경로여야 한다.
+
+```bash
+# 저장소 루트. FP/CKPT는 앞 절에서 준비한 로컬 디렉터리다.
+export BENCH_OUT="$PWD/results/pi05-fp-w8a8-$(date +%Y%m%d-%H%M%S)"
+python scripts/benchmark_pi05_fp_w8a8.py \
+  --fp-checkpoint "$FP" --w8a8-checkpoint "$CKPT" \
+  --output-dir "$BENCH_OUT" --device cuda:0 \
+  --w8a8-revision 2c9896f69be4a7dc7d7604688de3cd9e6a8ebeee \
+  --prompt "pick up the book" --num-steps 10 --seed 42 \
+  --warmup 10 --iterations 50 --opt-m 1 16 32 64
+```
+
+이 명령은 synthetic smoke input을 사용한다. 실측 latency는 기록하지만 실제 LIBERO 작업의
+성공률이나 episode 처리 성능을 나타내지 않는다. 기록한 LIBERO 관측을 사용하려면 위 명령에
+`--observation /srv/observations/libero_obs.npz`를 추가한다. NPZ는 기존 검증 스크립트와 같은
+`observation/state` `(8,)` 유한 벡터, `observation/image`, `observation/wrist_image` HWC RGB
+uint8을 포함하며 `allow_pickle=False`로 읽는다. prompt는 `--prompt` 값으로 두 모델에 동일하게 준다.
+동일한 관측 하나를 반복하므로 데이터셋 전체의 latency 분포를 측정한 결과도 아니다.
+
+FP 준비가 불가능한 서버에서 W8A8의 부분 결과만 남기는 명령은 다음과 같다.
+완전한 비교가 아니므로 의도적으로 종료 코드가 0이 아니며 speedup을 계산하지 않는다.
+
+```bash
+python scripts/benchmark_pi05_fp_w8a8.py \
+  --w8a8-checkpoint "$CKPT" \
+  --output-dir "$PWD/results/pi05-w8a8-only-$(date +%Y%m%d-%H%M%S)" \
+  --w8a8-revision 2c9896f69be4a7dc7d7604688de3cd9e6a8ebeee
+```
+
+| CLI 인자 | 기본값 / 의미 |
+| --- | --- |
+| `--fp-checkpoint` | 생략 가능. 공식 PyTorch FP 로컬 디렉터리. 없으면 FP `not_run` |
+| `--w8a8-checkpoint` | 필수. 공개 180계층 manifest와 `model.safetensors`, assets가 있는 로컬 디렉터리 |
+| `--output-dir` | 필수. 새 경로 또는 비어 있는 결과 디렉터리 |
+| `--fp-id` | `gs://openpi-assets/checkpoints/pi05_libero`; 출처 식별자 |
+| `--w8a8-id` | `fatdove/pi05-libero-w8a8`; 출처 식별자 |
+| `--fp-revision`, `--w8a8-revision` | 기본 `null`; 실제 준비한 가중치의 알려진 revision을 선언 |
+| `--device` | `cuda:0`; 두 모델에 같은 장치 사용 |
+| `--observation` | 생략 시 synthetic smoke; 지정 시 기존 검증 형식의 LIBERO NPZ |
+| `--prompt` | `pick up the book` |
+| `--num-steps` | `10`; denoising 반복 수 |
+| `--seed` | `42`; observation/noise 생성 및 PyTorch seed |
+| `--warmup` | `10`; 별도 첫 추론 이후 추가 warmup 횟수 |
+| `--iterations` | `50`; 통계에 포함하는 측정 추론 횟수 |
+| `--opt-m` | `1 16 32 64`; 기존 BitBLAS 커널 준비 설정 |
+| `--enable-tuning` | 기본 off; 지정하면 기존 BitBLAS tuning 활성화 및 설정 기록 |
+
+batch size는 공식 `Policy.infer()`의 단일 관측 계약에 따라 1로 고정한다.
+dtype은 공식 선택적 BF16 + 나머지 FP32 방식을 유지하며 W8A8 scale은 기존 FP32다.
+`torch.inference_mode()`를 사용하고 두 모델의 `pytorch_compile_mode=None`을 적용한다.
+이 CLI는 compile 활성화 비교를 지원하지 않는다. compile 실험 결과와 이 기준 결과를 섞지 않는다.
+두 모델은 동일 seed의 같은 초기 noise 배열을 모든 호출에 전달하며 입력/noise/정규화 통계의
+해시와 모델 설정·dtype·환경의 일치 여부를 비교 조건으로 검사한다.
+
+### 시간·메모리·크기와 결과 판독
+
+단일 CLI가 FP → W8A8을 각각 새로운 자식 프로세스에서 실행한다. 앞 모델의 CUDA allocator와
+모델 참조가 다음 모델에 남지 않도록 프로세스 종료를 격리 경계로 사용한다. 다른 프로세스의
+GPU 사용과 전력/온도/clock 변화는 통제하지 않으므로 전용 GPU와 동일 환경에서 반복한다.
+JAX는 CPU로 고정하여 전처리 import가 별도의 GPU 메모리를 예약하지 않게 한다.
+
+- 모델 로딩/초기화 전체 시간과, W8A8 `initialize_kernel()` 호출을 CUDA 동기화하여 합한
+  커널 준비 시간을 분리한다. 후자는 packing·BitBLAS build/compile·INT8 probe가 포함된 합계이며
+  세 작업을 독립 측정한 값이 아니다. 커널 시간을 제외한 로딩 시간도 함께 남긴다.
+- 첫 `policy.infer()`와 추가 warmup 총시간을 별도로 남기고, warmup 이후 매 호출 전후 CUDA를
+  동기화한 wall-clock latency를 기록한다. 공식 전처리·정규화·토큰화·전송·sampling·출력 변환을
+  포함한 전체 policy 기준이다. action 검사는 실행 결과에 적용하며 내부 denoising step별 profiler는 추가하지 않는다.
+- 측정 호출만으로 mean/p50/p95/min/max를 계산한다. 전체 비교 통과 시 동일 통계량의
+  `FP / W8A8` speedup을 계산한다. 초기 build/cache 비용을 steady-state latency에 섞지 않는다.
+  디스크의 BitBLAS/TVM cache는 삭제하거나 강제로 통제하지 않으므로 로딩·첫 추론 시간의
+  cold/warm cache 조건은 팀에서 별도로 기록해야 한다.
+- CUDA 동기화와 peak reset으로 로딩 완료 후 allocated/reserved, 로딩 및 커널 준비 구간의
+  peak allocated/reserved, 추론 구간의 peak allocated/reserved를 구분한다.
+  PyTorch allocator 통계는 CUDA context나 외부 BitBLAS/TVM 직접 할당까지 포함한 전체 VRAM이
+  아니므로 `nvidia-smi`와 같은 값으로 해석하지 않는다.
+- 크기는 각 로컬 디렉터리의 실제 `model.safetensors` 1개에 대해 bytes와 GiB를 기록한다.
+  assets/manifest/tokenizer/Hub cache 중복 사본은 합산하지 않는다. 두 가중치 크기가 확인되면
+  감소 비율과 압축 배율을 남기며 디스크 직렬화 dtype과 런타임 dtype은 구분한다.
+
+최종 결과 파일은 `--output-dir` 아래 세 개다.
+
+| 파일 | 내용 |
+| --- | --- |
+| `summary.json` | 측정 시각/Git SHA, Python/PyTorch/CUDA/BitBLAS/GPU 환경, checkpoint 출처/revision, 입력·noise·dtype·compile·추론 설정, 모델별 검사/실패 단계, 시간·VRAM·크기와 비교 |
+| `latency.csv` | `model,phase,iteration,latency_ms`; 첫 추론, warmup, 측정 호출을 모두 기록. 통계는 측정 phase만 사용 |
+| `benchmark.log` | 실행 과정, 경고, 오류 및 traceback |
+
+성공 판단은 exit 0, 두 모델의 실제 추론 완료, 출력 shape `(10, 7)`과 전체 action 유한성,
+두 모델의 비교 조건 일치, W8A8 공개 180계층의 INT8 probe 및 실제 첫 추론 중 각 계층의
+forward 호출 증가를 함께 확인한다. FP/W8A8 action 값의 일치는 요구하지 않는다.
+INT8 검증은 기존 BitBLAS 진단과 정수 reference probe를 사용하며 profiler에서 Tensor Core
+instruction을 직접 검증했다는 뜻은 아니다. 커널 사용을 확인하지 못하면 성공으로 기록하지 않는다.
+실패 단계와 이미 얻은 모델 결과/개별 latency는 가능한 범위에서 보존하고, 미측정 값은
+`null` 또는 `not_run`으로 남긴다. 실제 LIBERO success rate는 이 스크립트에서 측정하지 않는다.
+
+### 실패 시 확인 사항과 로컬 검증 범위
+
+- **FP 로딩 실패:** 로컬 `model.safetensors` 유무, 공식 converter/config, tied weights,
+  assets의 `physical-intelligence/libero/norm_stats.json`을 확인한다. `params/`만 있으면
+  공식 변환을 별도 준비하거나 FP `not_run`을 유지한다. JAX 결과로 speedup을 채우지 않는다.
+- **W8A8 로딩 실패:** 고정 revision, 원본 180계층 manifest, 전체 가중치 다운로드 완료 여부,
+  strict key/shape/scale 검사와 정규화 자산을 확인한다. Expert attention을 추가로 양자화하거나
+  252계층 후보로 대체하지 않는다. 서로 다른 정규화 통계는 공정 비교 검사를 통과하지 못한다.
+- **OOM:** `benchmark.log`의 실패 단계로 CPU RAM 부족과 CUDA OOM을 구분한다.
+  다른 GPU 프로세스, GPU 선택, 실제 여유 VRAM을 확인한다. 반복 수를 줄여도 모델 로딩
+  peak 자체는 줄지 않는다. 한 모델만 CPU/offload로 바꾼 결과는 같은 비교로 취급하지 않는다.
+- **BitBLAS build/packing/probe 오류:** 앞 절의 커널 검사부터 다시 확인한다. PyTorch/CUDA/driver,
+  BitBLAS/TVM 버전, GPU target, toolkit/compiler와 마지막 계층 traceback을 보존한다.
+  probe가 통과해도 실제 입력 token M에서 추가 compile/오류가 발생할 수 있다.
+- **부분 결과/종료 코드:** FP 부재, 모델 실패, 비교 조건 불일치에서 nonzero는 예상 동작이다.
+  `summary.json`과 로그를 확인하고 원인을 해결한 뒤 새 출력 디렉터리로 다시 실행한다.
+
+Windows 검증은 Python 문법, `--help`, 통계/speedup/JSON/CSV 및 가능한 CPU 회귀에 한정한다.
+GPU 로딩, BitBLAS 실제 packing/probe/forward, latency/VRAM, FP 변환 수치 보존, 실제 LIBERO
+관측 및 성공률, Orin 성능은 서버 팀원이 확인해야 한다. 실측 전에는 이 문서의 설명이나 공개
+모델 카드 수치를 우리 benchmark 결과로 사용하지 않는다.
+
+이번 벤치마크 구현의 Windows CPU 검증: `test_validation.py` 21개(기존 9개 + 신규 12개),
+`test_public_checkpoint.py` 4개, 총 **25개 PASS**. 통계/동일 통계량 speedup 및 비교 차단,
+JSON/CSV, 부분 결과/덮어쓰기 방지, 의존성을 import하지 않는 `--help`, 기존 INT8 진단,
+synthetic/NPZ 입력과 dtype/shape signature를 검사했다. Python AST/메모리 내 compile와
+`git diff --check`도 PASS다. 기존 `test_export_cpu.py`는 `safetensors` 미설치로 import 단계
+FAIL이며 GPU 실패를 의미하지 않는다. Ruff는 미설치로 미실행이다. 환경은 위의 로컬
+Python 3.10.11이며 서버의 지원 Python ≥3.11과 구분한다.
