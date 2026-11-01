@@ -2,6 +2,7 @@ import dataclasses
 import enum
 import logging
 import socket
+from typing import Annotated
 
 import tyro
 
@@ -31,6 +32,17 @@ class Checkpoint:
 
 
 @dataclasses.dataclass
+class W8A8:
+    """Load an already downloaded pi05_libero W8A8 checkpoint (CUDA only)."""
+
+    # Local directory containing model.safetensors, w8a8_config.json and assets/.
+    dir: str
+    device: str = "cuda:0"
+    # Disable torch.compile for initial validation; BitBLAS still compiles its kernels.
+    disable_compile_for_validation: bool = False
+
+
+@dataclasses.dataclass
 class Default:
     """Use the default policy for the given environment."""
 
@@ -52,7 +64,9 @@ class Args:
     record: bool = False
 
     # Specifies how to load the policy. If not provided, the default policy for the environment will be used.
-    policy: Checkpoint | Default = dataclasses.field(default_factory=Default)
+    policy: Checkpoint | Annotated[W8A8, tyro.conf.subcommand(name="w8a8")] | Default = dataclasses.field(
+        default_factory=Default
+    )
 
 
 # Default checkpoints that should be used for each environment.
@@ -88,6 +102,16 @@ def create_default_policy(env: EnvMode, *, default_prompt: str | None = None) ->
 def create_policy(args: Args) -> _policy.Policy:
     """Create a policy from the given arguments."""
     match args.policy:
+        case W8A8():
+            from openpi.policies.w8a8_policy import load_w8a8_policy
+
+            policy, _ = load_w8a8_policy(
+                args.policy.dir,
+                device=args.policy.device,
+                disable_compile_for_validation=args.policy.disable_compile_for_validation,
+                default_prompt=args.default_prompt,
+            )
+            return policy
         case Checkpoint():
             return _policy_config.create_trained_policy(
                 _config.get_config(args.policy.config), args.policy.dir, default_prompt=args.default_prompt

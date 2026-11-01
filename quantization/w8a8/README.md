@@ -5,6 +5,10 @@
 필요한 외부 코드와 의존성만 검토하여 가져온다.
 
 ## 현재 상태
+- **실제 LIBERO 성공률 평가 절차**: [LIBERO 실행 문서](../../examples/libero/README.md#공개-w8a8-모델로-libero-평가)를 따른다.
+  기존 `scripts/serve_policy.py`의 `policy:w8a8`가 전용 로더를 재사용하며,
+  `examples/libero/main.py`의 관측 전송·행동 실행·성공률 계산은 그대로 사용한다.
+  Windows 정적·CPU 검증만 수행했으며 실제 CUDA·LIBERO 평가는 실행하지 않았다.
 - **공개 180계층 checkpoint 재사용을 우선한다.** 확인한 형식, 252개 후보와의 차이,
   다운로드 → 전체 로딩 → INT8 probe → policy.infer 명령 및 통과 기준은
   [PUBLIC_CHECKPOINT.md](PUBLIC_CHECKPOINT.md)를 따른다. 실제 GPU 실행은 미검증이다.
@@ -23,7 +27,7 @@
 - 공식 코드: https://github.com/Physical-Intelligence/openpi
 - 양자화 구현: https://github.com/JingxuanZhang77/openpi_duquant
 - 모델: https://huggingface.co/fatdove/pi05-libero-w8a8
-- 외부 평가 파일: scripts/run_libero_w8a8.py
+- 실제 평가: [기존 LIBERO 평가기](../../examples/libero/main.py)
 
 ## 검증 원칙
 - 큰 모델 가중치는 GitHub에 올리지 않는다.
@@ -47,8 +51,9 @@
 - `scripts/inspect_w8a8.py`: 계층 목록·텐서 헤더 확인과 선택적 GPU 초기화 진단.
 - `NOTICE.md`, `LICENSE.openpi_duquant`: 출처·정확한 커밋·수정 사항과 원본 Apache-2.0 라이선스.
 
-공식 `create_trained_policy`에는 연결하지 않았다. W8A8 체크포인트를 기존 FP 로더에
-전달하지 말고 아래 전용 진입점을 사용한다. 공식 LIBERO 평가·서버 연결은 후속 작업이다.
+공식 `create_trained_policy`에는 연결하지 않았다. W8A8 체크포인트는 서버의
+`policy:w8a8 --policy.dir /path/to/checkpoint`로 선택하면 기존 `load_w8a8_policy()`를 사용한다.
+기존 FP용 `--env LIBERO`와 `policy:checkpoint` 실행도 유지한다.
 
 ## 지원하는 입력 계약과 중단 조건
 
