@@ -10,6 +10,7 @@ import argparse
 import dataclasses
 from datetime import datetime
 from datetime import timezone
+import gc
 import importlib.util
 import json
 import logging
@@ -20,6 +21,8 @@ from types import SimpleNamespace
 
 import torch
 
+from pruning.lm_head_audit import lm_head_metrics
+from pruning.lm_head_audit import observe_lm_head_calls
 from pruning.structured_ffn import prepare_pi05_pruned_shapes
 from pruning.structured_ffn import prune_pi05_ffns
 
@@ -27,6 +30,8 @@ CONFIG_NAME = "pi05_libero"
 STATE_DICT_NAME = "pruned_state_dict.pt"
 MANIFEST_NAME = "pruning_manifest.json"
 REPORT_NAME = "report.json"
+RESTORE_RTOL = 1e-5
+RESTORE_ATOL = 1e-6
 
 
 def write_json(path: Path, data: dict) -> None:
@@ -134,6 +139,7 @@ def parameter_metrics(model: torch.nn.Module) -> dict:
     return {
         "model": count(model.parameters()),
         "action_expert_ffn": count(p for layer in layers for p in layer.mlp.parameters()),
+        "action_expert_lm_head": lm_head_metrics(model),
         "expert_intermediate_sizes": [layer.mlp.gate_proj.out_features for layer in layers],
     }
 
@@ -160,17 +166,23 @@ def make_smoke_inputs(config, device: torch.device, batch_size: int, seed: int):
 
 
 @torch.inference_mode()
-def measure_output(model, device: torch.device, observation, noise: torch.Tensor, num_steps: int) -> dict:
-    output = model.sample_actions(device, observation, noise=noise.clone(), num_steps=num_steps)
+def measure_output(
+    model, device: torch.device, observation, noise: torch.Tensor, num_steps: int,
+) -> tuple[dict, torch.Tensor]:
+    """Validate actions and keep the tensor for the saved-model comparison."""
+    with observe_lm_head_calls(model) as lm_head_usage:
+        output = model.sample_actions(device, observation, noise=noise.clone(), num_steps=num_steps)
     if not isinstance(output, torch.Tensor):
         raise TypeError("sample_actions did not return a tensor.")
-    result = {"status": "passed", "shape": list(output.shape), "dtype": str(output.dtype)}
+    result = {
+        "status": "passed", "shape": list(output.shape), "dtype": str(output.dtype), "lm_head_usage": lm_head_usage,
+    }
     if list(output.shape) != list(noise.shape):
         raise ValueError(f"Unexpected action shape: {list(output.shape)}; expected {list(noise.shape)}")
     if not bool(torch.isfinite(output).all()):
         raise ValueError("sample_actions produced non-finite values.")
     result["all_finite"] = True
-    return result
+    return result, output.detach().clone()
 
 
 def save_pruned_artifacts(model, config, manifest: dict, output_dir: Path, *, save_state_dict: bool) -> dict:
@@ -239,6 +251,7 @@ def run(args: argparse.Namespace) -> tuple[dict, int]:
         "outputs": {
             "before": {"status": "unverified", "shape": None},
             "after": {"status": "unverified", "shape": None},
+            "restored": {"status": "unverified", "shape": None},
             "input_kind": "synthetic_preprocessed_observation_fixed_noise",
             "num_steps": args.num_steps,
             "batch_size": args.batch_size,
@@ -249,12 +262,16 @@ def run(args: argparse.Namespace) -> tuple[dict, int]:
             "original_checkpoint_loaded": False,
             "physical_pruning": False,
             "output_shapes_match": None,
-            "restore_roundtrip": {"status": "unverified"},
+            "restore_roundtrip": {
+                "status": "unverified", "reason": "No saved-model action comparison has run.",
+                "rtol": RESTORE_RTOL, "atol": RESTORE_ATOL,
+            },
             "libero_accuracy": {"status": "unverified", "reason": "No LIBERO evaluation is performed."},
         },
         "memory_definition": "Unique parameter numel * element_size; excludes buffers, activations, KV cache and allocator overhead.",
         "notes": ["Training-free weight-magnitude heuristic; no calibration, gradients or fine-tuning.",
-                  "Only Action Expert gated FFN intermediate channels are removed.",
+                  "Magnitude pruning is the baseline; only Action Expert gated FFN intermediate channels are removed.",
+                  "Action Expert lm_head is retained; usage observations apply only to each sampled forward.",
                   "Output shapes are raw model actions, before LIBERO policy postprocessing."],
     }
     exit_code = 2
@@ -276,7 +293,7 @@ def run(args: argparse.Namespace) -> tuple[dict, int]:
             try:
                 model.to(device)
                 inputs = make_smoke_inputs(config.model, device, args.batch_size, args.seed)
-                report["outputs"]["before"] = measure_output(model, device, *inputs, args.num_steps)
+                report["outputs"]["before"], _ = measure_output(model, device, *inputs, args.num_steps)
             except Exception as exc:
                 report["outputs"]["before"] = {"status": "failed", "shape": None, "error": f"{type(exc).__name__}: {exc}"}
                 inputs = None
@@ -298,20 +315,58 @@ def run(args: argparse.Namespace) -> tuple[dict, int]:
         report["artifacts"] = save_pruned_artifacts(model, config, manifest, output_dir, save_state_dict=not args.no_save_state_dict)
         if inputs is not None:
             stage = "pruned_forward"
-            report["outputs"]["after"] = measure_output(model, device, *inputs, args.num_steps)
+            report["outputs"]["after"], pruned_actions = measure_output(model, device, *inputs, args.num_steps)
             report["verification"]["output_shapes_match"] = report["outputs"]["before"]["shape"] == report["outputs"]["after"]["shape"]
+            if not args.no_save_state_dict:
+                # Release the compact model before constructing another full model,
+                # so the roundtrip does not require two resident GPU models.
+                del model
+                gc.collect()
+                if device.type == "cuda":
+                    torch.cuda.empty_cache()
+                stage = "restore_load"
+                roundtrip = report["verification"]["restore_roundtrip"]
+                roundtrip.pop("reason", None)
+                restored_model = load_pruned_model(output_dir, device=str(device))
+                stage = "restored_forward"
+                report["outputs"]["restored"], restored_actions = measure_output(
+                    restored_model, device, *inputs, args.num_steps,
+                )
+                stage = "restore_compare"
+                roundtrip.update({
+                    "actions_close": False,
+                    "max_abs_diff": (restored_actions.double() - pruned_actions.double()).abs().max().item(),
+                })
+                torch.testing.assert_close(
+                    restored_actions, pruned_actions, rtol=RESTORE_RTOL, atol=RESTORE_ATOL,
+                    check_dtype=True, check_device=True,
+                )
+                roundtrip.update(status="passed", actions_close=True)
+            else:
+                report["verification"]["restore_roundtrip"]["reason"] = "No state_dict was saved (--no-save-state-dict)."
+                report["outputs"]["restored"]["reason"] = "No state_dict was saved (--no-save-state-dict)."
         else:
             report["outputs"]["after"]["reason"] = "Forward checks were skipped or baseline forward failed."
-        report["status"] = "completed" if report["verification"]["output_shapes_match"] else "partial"
+            report["outputs"]["restored"]["reason"] = "Forward checks were skipped or baseline forward failed."
+            report["verification"]["restore_roundtrip"]["reason"] = "Forward checks were skipped or baseline forward failed."
+        verified = (
+            report["verification"]["output_shapes_match"]
+            and report["verification"]["restore_roundtrip"]["status"] == "passed"
+        )
+        report["status"] = "completed" if verified else "partial"
         exit_code = 0 if report["status"] == "completed" else 2
-    except (ImportError, FileNotFoundError) as exc:
-        report["status"] = "unverified"
-        report["error"] = {"stage": stage, "type": type(exc).__name__, "message": str(exc)}
     except Exception as exc:
-        report["status"] = "failed"
+        missing_prerequisite = stage in ("preflight", "load_original_bf16") and isinstance(exc, (ImportError, FileNotFoundError))
+        report["status"] = "unverified" if missing_prerequisite else "failed"
         report["error"] = {"stage": stage, "type": type(exc).__name__, "message": str(exc)}
-        exit_code = 1
-        logging.exception("Structured pruning failed during %s", stage)
+        if stage in ("restore_load", "restored_forward", "restore_compare"):
+            report["verification"]["restore_roundtrip"].update(status="failed", error=report["error"])
+        phase = {"pruned_forward": "after", "restored_forward": "restored"}.get(stage)
+        if phase:
+            report["outputs"][phase].update(status="failed", error=f"{type(exc).__name__}: {exc}")
+        exit_code = 2 if missing_prerequisite else 1
+        if not missing_prerequisite:
+            logging.exception("Structured pruning failed during %s", stage)
     finally:
         write_json(output_dir / REPORT_NAME, report)
     return report, exit_code
@@ -328,8 +383,8 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--num-steps", type=int, default=10)
     parser.add_argument("--seed", type=int, default=123)
     parser.add_argument("--preflight-only", action="store_true", help="Inspect prerequisites without downloading or loading weights.")
-    parser.add_argument("--skip-forward", action="store_true", help="Prune/save only; output shapes remain unverified.")
-    parser.add_argument("--no-save-state-dict", action="store_true", help="Save report/manifest only.")
+    parser.add_argument("--skip-forward", action="store_true", help="Prune/save only; outputs and restore roundtrip remain unverified.")
+    parser.add_argument("--no-save-state-dict", action="store_true", help="Save report/manifest only; restore roundtrip remains unverified.")
     args = parser.parse_args(argv)
     if not 0 < args.prune_fraction < 1:
         parser.error("--prune-fraction must be in (0, 1).")
