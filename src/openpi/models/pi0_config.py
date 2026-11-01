@@ -33,6 +33,8 @@ class Pi0Config(_model.BaseModelConfig):
     discrete_state_input: bool = None  # type: ignore
 
     pytorch_compile_mode: str | None = "max-autotune"
+    # PyTorch only: average horizontal pairs in each 16x16 image token grid to 16x8.
+    vision_token_pooling: bool = False
 
     def __post_init__(self):
         if self.max_token_len is None:

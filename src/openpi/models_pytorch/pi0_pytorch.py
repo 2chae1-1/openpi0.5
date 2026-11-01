@@ -202,6 +202,15 @@ class PI0Pytorch(nn.Module):
 
             img_emb = self._apply_checkpoint(image_embed_func, img)
 
+            if self.config.vision_token_pooling:
+                if img_emb.shape[1] != 256:
+                    raise ValueError(
+                        f"Vision token pooling requires 256 image tokens (16x16 grid), got {img_emb.shape[1]}"
+                    )
+                # SigLIP tokens are row-major. Pool horizontal neighbors within this camera only.
+                bsize, _, embed_dim = img_emb.shape
+                img_emb = img_emb.reshape(bsize, 16, 8, 2, embed_dim).mean(dim=3).reshape(bsize, 128, embed_dim)
+
             bsize, num_img_embs = img_emb.shape[:2]
 
             embs.append(img_emb)
