@@ -81,11 +81,32 @@ def make_att_2d_masks(pad_masks, att_masks):
     return att_2d_masks & pad_2d_masks
 
 
+@torch.compiler.disable
+def _filter_inactive_images(images, img_masks):
+    """Select cameras eagerly so tensor-dependent prefix lengths are not traced.
+
+    Recheck every batch: a camera with any valid image must keep its entire block.
+    On accelerators, collect the small mask reductions in one host transfer. This
+    explicit graph break supports torch.compile with fullgraph=False (the default);
+    changing the active camera layout may compile another prefix graph.
+    """
+    image_pairs = list(zip(images, img_masks, strict=True))
+    if not image_pairs:
+        return [], []
+    active = torch.stack([mask.any() for _, mask in image_pairs]).tolist()
+    return (
+        [img for (img, _), keep in zip(image_pairs, active, strict=True) if keep],
+        [mask for (_, mask), keep in zip(image_pairs, active, strict=True) if keep],
+    )
+
+
 class PI0Pytorch(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
         self.pi05 = config.pi05
+        if config.pytorch_skip_inactive_images and not self.pi05:
+            raise ValueError("pytorch_skip_inactive_images is only supported for PyTorch pi05 models")
 
         paligemma_config = _gemma.get_config(config.paligemma_variant)
         action_expert_config = _gemma.get_config(config.action_expert_variant)
@@ -190,6 +211,9 @@ class PI0Pytorch(nn.Module):
         """Embed images with SigLIP and language tokens with embedding layer to prepare
         for PaliGemma transformer processing.
         """
+        if self.pi05 and self.config.pytorch_skip_inactive_images:
+            images, img_masks = _filter_inactive_images(images, img_masks)
+
         embs = []
         pad_masks = []
         att_masks = []

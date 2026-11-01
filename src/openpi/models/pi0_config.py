@@ -33,6 +33,9 @@ class Pi0Config(_model.BaseModelConfig):
     discrete_state_input: bool = None  # type: ignore
 
     pytorch_compile_mode: str | None = "max-autotune"
+    # PyTorch pi05 only: omit cameras whose image mask is False for the entire batch.
+    # Selection runs eagerly before image embedding, including when using torch.compile.
+    pytorch_skip_inactive_images: bool = False
 
     def __post_init__(self):
         if self.max_token_len is None:
