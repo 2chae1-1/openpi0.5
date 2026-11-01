@@ -14,8 +14,10 @@
   Retained W8A8 math, BitBLAS configuration, explicit Linear replacement and
   complete checkpoint loading. Added strict tensor/statistics validation,
   verified tied-weight alias restoration, separate raw/packed weights and
-  integer kernel probes. Removed W8FP16, fallback, download/upload, capture,
-  persistent tuning cache and experiment diagnostics. Official OpenPI model,
+  integer kernel probes. The lightweight benchmark restores per-layer operator
+  call/dtype counters and target/probe diagnostics from development branch
+  `quantization/w8a8-setup` (`723135c7bb11eb3ca3df1c41a9d7474f821f3af7`).
+  Removed W8FP16, fallback, download/upload, capture and persistent tuning cache. Official OpenPI model,
   transforms and LIBERO evaluator are unchanged.
 - [BitBLAS](https://github.com/microsoft/BitBLAS) is an external MIT-licensed
   dependency, not vendored here. A compatible BitBLAS/TVM build is not verified.

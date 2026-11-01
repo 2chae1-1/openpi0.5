@@ -103,7 +103,7 @@ def create_policy(args: Args) -> _policy.Policy:
     """Create a policy from the given arguments."""
     match args.policy:
         case W8A8():
-            from openpi.policies.w8a8_policy import load_w8a8_policy  # noqa: PLC0415 -- optional W8A8 dependency
+            from openpi.policies.w8a8_policy import load_w8a8_policy
 
             policy, _ = load_w8a8_policy(
                 args.policy.dir,

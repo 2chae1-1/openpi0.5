@@ -1,128 +1,111 @@
-# 공개 W8A8 π0.5 LIBERO 일회 평가
+# π0.5 LIBERO W8A8 경량화 확인
 
-`handoff/libero-w8a8`은 `main` (`215abfb217dbac7d5f1273282331b9b1866c0479`) 기반이다.
-[fatdove/pi05-libero-w8a8](https://huggingface.co/fatdove/pi05-libero-w8a8)을 내려받아
-기존 WebSocket 서버와 LIBERO 평가기로 4개 suite의 성공률을 측정한다. 재양자화·학습·FP 체크포인트는 필요 없다.
-**Windows 정적/소형 CPU 검사만 수행했다. 전체 모델 로딩, CUDA·BitBLAS·LIBERO 실행과 성공률은 미검증이다.**
+`handoff/libero-w8a8`에서 로컬 W8A8 체크포인트를 한 명령으로 측정한다.
+개발 브랜치 `quantization/w8a8-setup` (`723135c7`)의
+`scripts/benchmark_pi05_fp_w8a8.py`를 재사용했다. 실행 파일은 이 스크립트 하나다.
+실제 INT8 가중치·BitBLAS 호출, 체크포인트 크기, GPU 메모리와 추론시간을 저장한다.
+시뮬레이터·성공률·Replay 영상·학습·재양자화는 실행하지 않는다.
 
-## 사전 환경
+**Windows CPU 회귀 검사만 수행했다. 전체 모델 로딩과 CUDA/BitBLAS 실행 및 실제 수치는 미검증이다.**
 
-- Linux NVIDIA GPU 서버, driver, CUDA Toolkit(`nvcc`), C++ 빌드 도구, Bash, Git, `uv`.
-- 모델 서버: 기존 Python 3.11 OpenPI 환경(기본 `.venv/bin/python`), 저장소의 전체 의존성,
-  PyTorch **2.7.1**, Transformers **4.53.2**와 [공식 저장소 패치](../../README.md#setup), `safetensors`.
-- BitBLAS/TVM: `bitblas.ops.Matmul/MatmulConfig`, `backend="tir"`, `transform_weight`,
-  INT8×INT8→INT32를 지원하는 빌드. 이 포트와 호환되는 빌드/GPU 조합은 아직 검증하지 않았다.
-  미설치 환경의 설치 출발점은 `uv pip install --python .venv/bin/python bitblas safetensors`와
-  [BitBLAS 공식 안내](https://github.com/microsoft/BitBLAS#installing-with-pip)다.
-  커널 생성·packing·정수 probe 실패 시 서버가 중단한다. 실패 로그를 전달한다.
-- 평가기: **이미 정상 동작하는 LIBERO 환경**(기본 `examples/libero/.venv/bin/python`),
-  [평가 의존성](requirements.in), `third_party/libero`의 assets/BDDL/init states, EGL/OpenGL 및 ffmpeg.
-  저장소의 기존 구성은 서버 Python 3.11 / 평가 Python 3.8 분리다. 기존 환경을 재생성하거나 sync하지 않는다.
-- Hugging Face 접근 및 최초 실행 때 PaliGemma tokenizer 다운로드를 위한 Google Cloud Storage 접근.
-  공개 가중치는 약 5.27 GB이며, 모델 생성 중 CPU RAM과 GPU VRAM의 실제 최대 사용량은 미측정이다.
+## 서버 준비
 
-모든 명령은 전달받은 저장소 루트에서 실행한다. Python 경로가 다르면 아래 두 변수만 기존 환경으로 바꾼다.
-기존 Docker 서버 이미지에는 BitBLAS가 없으므로 아래 호스트 실행을 사용한다.
+- Linux NVIDIA GPU 서버와 기존 OpenPI Python 3.11+ 환경(아래 기본 경로 `.venv/bin/python`).
+  프로젝트의 PyTorch 2.7.1, Transformers 4.53.2와
+  [공식 Transformers 교체 파일 적용](../../README.md#pytorch-support), `safetensors`가 필요하다.
+- BitBLAS/TVM은 `bitblas.ops.Matmul/MatmulConfig`, `backend="tir"`, `transform_weight`,
+  INT8×INT8→INT32를 지원해야 한다. 호환 빌드/GPU 조합은 아직 검증하지 않았다.
+  초기 커널 생성·packing·정수 probe는 실행하며 튜닝은 기본 off다. FP fallback은 없다.
+- NVML Python 모듈 `pynvml`이 있으면 프로세스 전체 VRAM도 50 ms 간격으로 관측한다.
+  없을 때만 `uv pip install --python .venv/bin/python nvidia-ml-py`로 설치한다.
+  모듈/드라이버/권한상 측정 불가인 값은 `null`과 이유를 남긴다.
+- PaliGemma tokenizer 캐시를 준비한다. 캐시가 없으면 기존 OpenPI transform이 최초 다운로드를 시도한다.
+  체크포인트는 자동 다운로드하지 않는다. LIBERO 평가 환경·assets·EGL·ffmpeg는 필요 없다.
 
-## 1. 코드 전달 및 모델 다운로드
+체크포인트 디렉터리는 다음 구조여야 한다. 기존 로더의 strict tensor 검증과 정규화 통계 검증을 그대로 사용한다.
 
-이 작업은 **commit/push하지 않은 로컬 변경**이므로 원격 `clone --branch handoff/libero-w8a8`로 받을 수 없다.
-함께 전달한 `libero-w8a8.patch`를 기존 저장소의 깨끗한 작업 트리에 적용한다.
-이미 변경 파일이 포함된 작업 디렉터리를 받았다면 첫 세 명령은 생략한다.
-
-```bash
-git switch -c handoff/libero-w8a8 215abfb217dbac7d5f1273282331b9b1866c0479
-git apply --check /path/to/libero-w8a8.patch
-git apply /path/to/libero-w8a8.patch
+```text
+checkpoints/pi05-libero-w8a8-public/
+  model.safetensors
+  w8a8_config.json
+  assets/physical-intelligence/libero/norm_stats.json
 ```
 
+공개 모델이 아직 없으면 저장소 루트에서 한 번 내려받는다. 아래 revision은 기존 인계 문서에 기록된 값이다.
+
 ```bash
-set -euo pipefail
-git submodule update --init --recursive third_party/libero
-export CKPT="$PWD/checkpoints/pi05-libero-w8a8-public"
 uvx --from huggingface_hub hf download fatdove/pi05-libero-w8a8 \
   --revision 2c9896f69be4a7dc7d7604688de3cd9e6a8ebeee \
-  --local-dir "$CKPT" \
-  --include model.safetensors w8a8_config.json \
-    assets/physical-intelligence/libero/norm_stats.json
+  --local-dir checkpoints/pi05-libero-w8a8-public \
+  --include model.safetensors w8a8_config.json assets/physical-intelligence/libero/norm_stats.json
 ```
 
-이 3개 파일의 상대 경로를 유지한다. 가중치는 Git에 넣지 않는다(`checkpoints/`는 이미 ignore됨).
-revision은 개발 브랜치의 공개 체크포인트 조사에서 가져온 값이다.
-파일별 다운로드 옵션은 [Hugging Face 공식 문서](https://huggingface.co/docs/huggingface_hub/en/guides/download)를 따른다.
+## 복사해서 실행할 명령
 
-## 2. 모델 서버 — 터미널 1
+변경 파일이 포함된 저장소 루트에서 실행한다. Python 또는 체크포인트 위치가 다르면 해당 경로만 바꾼다.
 
 ```bash
-set -euo pipefail
-export SERVER_PYTHON="$PWD/.venv/bin/python"
-export CKPT="$PWD/checkpoints/pi05-libero-w8a8-public"
-export PYTHONPATH="$PWD/src:$PWD/packages/openpi-client/src${PYTHONPATH:+:$PYTHONPATH}"
-export JAX_PLATFORMS=cpu
-export RUN="$PWD/data/libero/w8a8-$(date +%Y%m%d-%H%M%S)"
-mkdir -p "$RUN"
-printf '%s\n' "$RUN" > data/libero/latest-w8a8-run.txt
-git rev-parse HEAD > "$RUN/repository-base.txt"
-sha256sum scripts/serve_policy.py src/openpi/policies/w8a8_policy.py \
-  src/openpi/models_pytorch/bitblas_w8a8_layers.py examples/libero/README.md \
-  > "$RUN/source-sha256.txt"
-printf '%s\n' 'fatdove/pi05-libero-w8a8@2c9896f69be4a7dc7d7604688de3cd9e6a8ebeee' > "$RUN/checkpoint.txt"
-uv pip freeze --python "$SERVER_PYTHON" > "$RUN/server-packages.txt"
-nvidia-smi > "$RUN/nvidia-smi.txt"
-"$SERVER_PYTHON" -u scripts/serve_policy.py --env LIBERO --port 8000 \
-  policy:w8a8 --policy.dir "$CKPT" --policy.device cuda:0 \
-  --policy.disable-compile-for-validation 2>&1 | tee "$RUN/server.log"
+.venv/bin/python -u scripts/benchmark_pi05_fp_w8a8.py --w8a8-checkpoint checkpoints/pi05-libero-w8a8-public --output-dir "data/w8a8-smoke-$(date +%Y%m%d-%H%M%S)"
 ```
 
-8000 포트에서 서버가 대기할 때 다음 단계로 진행한다. 최초 tokenizer 다운로드와 BitBLAS 커널 생성이 오래 걸릴 수 있다.
-위 옵션은 `torch.compile`만 끄며 BitBLAS 커널 생성과 각 레이어의 INT8 정수 probe는 수행한다.
-체크포인트는 엄격하게 로딩하며 FP matmul로의 fallback은 없다.
+기본값은 `cuda:0`, batch 1, denoising 10 steps, seed 42, 고정 합성 RGB 이미지 2장과 8차원 state,
+최초 추론 1회 + 추가 warmup 10회 + 측정 50회다. 필요하면 같은 명령 뒤에
+`--device cuda:1 --warmup 5 --iterations 100`처럼 붙인다.
+`torch.compile`은 이 벤치마크에서 끄고 `JAX_PLATFORMS=cpu`를 worker import 전에 설정한다.
+첫 커널 준비는 오래 걸릴 수 있다. 진행 상황은 출력 디렉터리의 `benchmark.log`에 기록한다.
 
-## 3. LIBERO 평가 — 터미널 2, 같은 저장소 루트
+FP가 없으면 `models.fp.status`와 `comparison.status`는 `not_measured`이며
+속도·크기·메모리 개선율을 추정하지 않는다. JSON 숫자는 `null`, CSV 숫자 칸은 빈칸이다.
+FP 경로를 지정했어도 `model.safetensors`가 없으면 같은 방식으로 건너뛴다.
+이미 로컬 FP 체크포인트가 있을 때만 위 명령에 `--fp-checkpoint /path/to/pi05-libero-fp`를 붙인다.
+FP/W8A8은 각각 새 프로세스에서 순차 측정하며 입력·noise·정규화·모델 설정·실행 환경이 일치하고
+양쪽 검증이 성공한 경우에만 비교한다. FP를 새로 받거나 변환할 필요는 없다.
 
-```bash
-set -euo pipefail
-export LIBERO_PYTHON="$PWD/examples/libero/.venv/bin/python"
-export RUN="$(cat data/libero/latest-w8a8-run.txt)"
-export PYTHONPATH="$PWD/packages/openpi-client/src:$PWD/third_party/libero${PYTHONPATH:+:$PYTHONPATH}"
-export MUJOCO_GL=egl
-uv pip freeze --python "$LIBERO_PYTHON" > "$RUN/libero-packages.txt"
-for suite in libero_spatial libero_object libero_goal libero_10; do
-  "$LIBERO_PYTHON" -u examples/libero/main.py \
-    --args.host 127.0.0.1 --args.port 8000 \
-    --args.task-suite-name "$suite" --args.num-trials-per-task 50 \
-    --args.seed 7 --args.replan-steps 5 \
-    --args.video-out-path "$RUN/videos/$suite" \
-    2>&1 | tee "$RUN/$suite.log"
-  if grep -q 'Caught exception:' "$RUN/$suite.log"; then
-    echo "평가 중 예외 발생: $suite — 로그를 전달하세요." >&2
-    exit 1
-  fi
-  grep -q 'Total episodes: 500$' "$RUN/$suite.log"
-  grep -E 'Total success rate:|Total episodes:' "$RUN/$suite.log" \
-    | sed "s/^/$suite /" | tee -a "$RUN/summary.txt"
-done
+## JSON/CSV 결과
+
+`--output-dir` 아래에 자동 저장한다. 기존 결과가 있는 디렉터리는 덮어쓰지 않는다.
+
+| 파일 | 내용 |
+| --- | --- |
+| `summary.json` | 전체 결과, 환경, 레이어별 INT8 증거, 메모리, 평균/p50/p95, 실패 단계·이유 |
+| `summary.csv` | 모델별 1행: 체크포인트 bytes, mean/p50/p95 ms, INT8 검증, VRAM, 선택적 FP 비교 |
+| `latency.csv` | 모든 완료된 호출의 `model,phase,iteration,latency_ms`; `phase=measurement`만 집계 대상 |
+| `benchmark.log` | 로딩/커널 준비/추론 진행과 오류 traceback |
+
+`summary.json`의 `models.w8a8`에서 다음 값을 확인한다.
+
+| 항목 | JSON 필드와 의미 |
+| --- | --- |
+| INT8 가중치 | `checks.int8_weights=passed`; `diagnostics_after.layers`의 실제 `qweight_dtype`, shape, bytes |
+| BitBLAS INT8 사용 | `checks.int8_kernels`와 `checks.all_target_layers_called`가 `passed`; 모든 manifest 레이어의 정수 reference probe 통과, 실제 추론 `forward_calls` 증가, 호출 입력 `torch.int8`·출력 `torch.int32` 확인 |
+| 체크포인트 크기 | `checkpoint_weights.bytes` / `gib`: `model.safetensors` 파일 전체. 통계/metadata/캐시 중복은 제외 |
+| 로딩 직후 GPU 메모리 | `memory.loaded.allocated_bytes` / `reserved_bytes` |
+| PyTorch 최대 VRAM | `memory.loading`과 `memory.inference`의 `peak_allocated_bytes` / `peak_reserved_bytes`; CSV는 두 구간의 최대값 |
+| 프로세스 전체 VRAM | `memory.nvml.process_used_bytes` / `process_peak_used_bytes`; BitBLAS/TVM의 외부 CUDA 할당 포함, 로딩/추론 구간은 `phases`에 별도 저장 |
+| 장치 전체 VRAM | `memory.nvml.device_used_bytes` / `device_peak_used_bytes`; 다른 프로세스도 포함 |
+| 추론시간 | `latency_statistics.mean_ms`, `p50_ms`, `p95_ms`, `samples` |
+
+시간은 CUDA를 호출 전후 동기화한 `policy.infer()` 전체 wall time이다.
+전처리·GPU 연산·CPU로 action 반환·후처리를 포함하고, 로딩/커널 준비/최초 추론/warmup은 평균과 percentile에서 제외한다.
+1회는 `pi05_libero` action chunk 전체(10 actions)를 만드는 호출이다. percentile은 선형 보간이다.
+합성 입력의 고정 관측 성능 확인이며 LIBERO 성공률이나 품질을 나타내지 않는다.
+
+W8A8은 manifest의 Linear 레이어만 의미하며 나머지 모델에는 FP 가중치/연산이 남는다.
+INT8 확인은 실행 경로와 정수 probe 기반이며 하드웨어 명령 profiler 검증은 `profiler_verified=false`로 남긴다.
+PyTorch peak는 allocator 내부 최대값이고 외부 할당을 포함하지 않는다.
+NVML peak는 50 ms 간격 **관측 최대값**이므로 더 짧은 순간의 peak를 놓칠 수 있다.
+NVML 값의 정의는 [NVIDIA NVML API](https://docs.nvidia.com/deploy/nvml-api/latest/api/group__nvmlDeviceQueries.html)를 따른다.
+
+정상 W8A8 단독 측정은 FP 미측정이어도 exit 0 / 최상위 `status=passed`다.
+요청된 모델 검증 실패·CUDA 부재·중단은 exit 1 / `incomplete`로 부분 JSON/CSV와 로그를 남긴다.
+NVML만 측정 불가여도 모델 검증은 계속하며 `memory.nvml.status`와 `errors`를 반드시 함께 확인한다.
+출력 폴더 전체를 팀에 전달하면 된다. 실제 GPU 측정값은 서버에서 실행한 뒤에만 보고한다.
+
+## Windows CPU 검사
+
+```powershell
+python -B -m unittest discover -s quantization/w8a8 -p test_benchmark.py -v
 ```
 
-각 suite는 10 tasks × 50회, 총 2,000 episodes다. 네 suite 모두 정상 완료했을 때만 전체 평균을 보고한다.
-평가기 내부에서 잡은 예외도 로그로 검사한다. 도중 실패하면 남은 suite를 진행하지 말고 현재 로그를 전달한다.
-LIBERO 최초 경로 질문에는 이 저장소의 `third_party/libero` 경로를 사용한다.
-EGL 대신 기존 환경에 X 디스플레이가 준비되어 있으면 `MUJOCO_GL=glx`로 바꾼다.
-
-## 4. 결과 전달
-
-평가가 끝나면 터미널 1의 서버를 `Ctrl-C`로 종료한다.
-`data/libero/latest-w8a8-run.txt`에 기록된 디렉터리 전체를 전달한다:
-`summary.txt`(suite별 최종 성공률 0~1/episode 수), `server.log`, suite별 로그,
-Python 패키지 목록, GPU 정보, 코드 SHA256, 저장소 base commit, HF revision, `videos/`.
-실패한 경우 같은 디렉터리의 실패 로그를 전달한다. 기존 평가기의 영상 이름은 task 성공/실패별로 덮어써서 일부 replay만 남는다.
-
-## 기존 FP 실행
-
-같은 모델 서버 환경에서 기존 기본 FP 및 사용자 FP 체크포인트 선택도 유지된다.
-
-```bash
-"$SERVER_PYTHON" scripts/serve_policy.py --env LIBERO
-"$SERVER_PYTHON" scripts/serve_policy.py --env LIBERO \
-  policy:checkpoint --policy.config pi05_libero --policy.dir /path/to/fp-checkpoint
-```
+표준 라이브러리 `unittest`와 기존 CPU PyTorch/NumPy로 보고서, FP 생략, 실패 보존,
+INT8 호출 계측, NVML 대체 객체를 검사한다. 전체 모델·CUDA·실제 BitBLAS는 실행하지 않는다.

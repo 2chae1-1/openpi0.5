@@ -24,6 +24,11 @@ class BitBLASW8A8Linear(nn.Module):
         self.register_buffer("_packed_weight", None, persistent=False)
         self.bitblas_matmul = None
         self.kernel_verified = False
+        self.kernel_target = None
+        self.probe_m = None
+        self.forward_calls = 0
+        self.last_activation_dtype = None
+        self.last_output_dtype = None
 
     @property
     def weight(self) -> torch.Tensor:
@@ -34,6 +39,11 @@ class BitBLASW8A8Linear(nn.Module):
         """Build, pack and verify a real CUDA INT8 call against an integer reference."""
         self.kernel_verified = False
         self.bitblas_matmul = None
+        self.kernel_target = None
+        self.probe_m = None
+        self.forward_calls = 0
+        self.last_activation_dtype = None
+        self.last_output_dtype = None
         self._packed_weight = None
         if self.qweight.device.type != "cuda":
             raise RuntimeError(f"{self.name}: W8A8 requires CUDA weights; CPU fallback is disabled")
@@ -60,7 +70,7 @@ class BitBLASW8A8Linear(nn.Module):
                 )
                 operator = Matmul(config, target=target, backend="tir", enable_tuning=enable_tuning)
                 packed = operator.transform_weight(self.qweight.contiguous())
-                if isinstance(packed, (list, tuple)):
+                if isinstance(packed, list | tuple):
                     if len(packed) != 1:
                         raise RuntimeError("Unsupported multi-tensor BitBLAS weight layout")
                     packed = packed[0]
@@ -78,6 +88,8 @@ class BitBLASW8A8Linear(nn.Module):
                 self._packed_weight = packed
                 self.bitblas_matmul = operator
                 self.kernel_verified = True
+                self.kernel_target = str(target)
+                self.probe_m = opt_m[0]
         except Exception as exc:
             raise RuntimeError(f"{self.name}: BitBLAS INT8 initialization/packing/probe failed") from exc
 
@@ -92,6 +104,10 @@ class BitBLASW8A8Linear(nn.Module):
         quantized = (x_2d / scale).round().clamp(-127, 127).to(torch.int8).contiguous()
         output = torch.empty((x_2d.shape[0], self.out_features), dtype=torch.int32, device=x.device)
         self.bitblas_matmul(quantized, self._packed_weight, output=output)
+        # Record only returned operator calls, separately from initialization probes.
+        self.forward_calls += 1
+        self.last_activation_dtype = str(quantized.dtype)
+        self.last_output_dtype = str(output.dtype)
         result = output.float() * (scale * self.weight_scale.float())
         if self.bias is not None:
             result = result + self.bias.float()
@@ -109,3 +125,36 @@ def replace_w8a8_layers(model: nn.Module, layer_names: list[str]) -> None:
     for name, linear in originals.items():
         parent, _, attribute = name.rpartition(".")
         setattr(model.get_submodule(parent), attribute, BitBLASW8A8Linear(linear, name))
+
+
+def w8a8_diagnostics(model: nn.Module) -> dict:
+    """Separate real integer probes and inference operator calls from profiler evidence."""
+    layers = [
+        {
+            "name": name,
+            "in_features": layer.in_features,
+            "out_features": layer.out_features,
+            "qweight_dtype": str(layer.qweight.dtype),
+            "qweight_shape": list(layer.qweight.shape),
+            "qweight_bytes": layer.qweight.numel() * layer.qweight.element_size(),
+            "device": str(layer.qweight.device),
+            "operator_created": layer.bitblas_matmul is not None,
+            "weight_packed": layer._packed_weight is not None,  # noqa: SLF001
+            "int8_probe_passed": layer.kernel_verified,
+            "forward_calls": layer.forward_calls,
+            "target": layer.kernel_target,
+            "probe_m": layer.probe_m,
+            "activation_dtype": "int8",
+            "accum_dtype": "int32",
+            "last_activation_dtype": layer.last_activation_dtype,
+            "last_output_dtype": layer.last_output_dtype,
+        }
+        for name, layer in model.named_modules()
+        if isinstance(layer, BitBLASW8A8Linear)
+    ]
+    return {
+        "layer_count": len(layers),
+        "all_int8_probes_passed": bool(layers) and all(layer["int8_probe_passed"] for layer in layers),
+        "profiler_verified": False,
+        "layers": layers,
+    }
