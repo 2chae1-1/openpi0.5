@@ -22,7 +22,51 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 import inspect_w8a8
 from openpi.models_pytorch.bitblas_w8a8_layers import replace_w8a8_layers
+from openpi.policies.w8a8_policy import prepare_checkpoint_state
 from openpi.policies.w8a8_policy import validate_state_dict
+
+
+class CheckpointAliasTest(unittest.TestCase):
+    head = "paligemma_with_expert.paligemma.lm_head.weight"
+    embedding = "paligemma_with_expert.paligemma.model.language_model.embed_tokens.weight"
+
+    def make_model(self, *, tied=True):
+        model = torch.nn.Module()
+        for name in (self.head, self.embedding):
+            parent = model
+            parts = name.split(".")
+            for part in parts[:-1]:
+                if not hasattr(parent, part):
+                    parent.add_module(part, torch.nn.Module())
+                parent = getattr(parent, part)
+            parent.register_parameter(parts[-1], torch.nn.Parameter(torch.ones(4, 3)))
+        if tied:
+            model.get_submodule(self.head.rsplit(".", 1)[0]).weight = model.get_parameter(self.embedding)
+        return model
+
+    def test_restores_either_verified_alias(self):
+        for omitted, retained in ((self.head, self.embedding), (self.embedding, self.head)):
+            with self.subTest(omitted=omitted):
+                model = self.make_model()
+                state = {retained: torch.ones(4, 3)}
+                prepare_checkpoint_state(model, state)
+                self.assertIs(state[omitted], state[retained])
+                validate_state_dict(model, state, [])
+                model.load_state_dict(state, strict=True)
+
+    def test_does_not_restore_untied_weights_or_both_missing(self):
+        for tied, state in ((False, {self.head: torch.ones(4, 3)}), (True, {})):
+            with self.subTest(tied=tied):
+                model = self.make_model(tied=tied)
+                prepare_checkpoint_state(model, state)
+                with self.assertRaisesRegex(ValueError, "missing="):
+                    validate_state_dict(model, state, [])
+
+    def test_rejects_conflicting_tied_values(self):
+        model = self.make_model()
+        state = {self.head: torch.ones(4, 3), self.embedding: torch.zeros(4, 3)}
+        with self.assertRaisesRegex(ValueError, "Conflicting checkpoint values"):
+            prepare_checkpoint_state(model, state)
 
 
 class ScaleValidationTest(unittest.TestCase):

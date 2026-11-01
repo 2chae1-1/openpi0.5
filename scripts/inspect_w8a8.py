@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import logging
 import pathlib
 
 
@@ -14,6 +15,7 @@ def main():
     parser.add_argument("--enable-tuning", action="store_true")
     parser.add_argument("--opt-m", type=int, nargs="+", default=[1, 16, 32, 64])
     args = parser.parse_args()
+    logging.basicConfig(level=logging.INFO)
 
     if args.initialize:
         from openpi.models_pytorch.bitblas_w8a8_layers import w8a8_diagnostics

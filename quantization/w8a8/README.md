@@ -5,6 +5,9 @@
 필요한 외부 코드와 의존성만 검토하여 가져온다.
 
 ## 현재 상태
+- **공개 180계층 checkpoint 재사용을 우선한다.** 확인한 형식, 252개 후보와의 차이,
+  다운로드 → 전체 로딩 → INT8 probe → policy.infer 명령 및 통과 기준은
+  [PUBLIC_CHECKPOINT.md](PUBLIC_CHECKPOINT.md)를 따른다. 실제 GPU 실행은 미검증이다.
 - 외부 W8A8 구현은 재현 검증 후보
 - 작업 브랜치: quantization/w8a8-setup
 - 양자화 코드 이식: 최소 구현 추가, 정적 검사 완료 (2026-10-31)
@@ -49,8 +52,8 @@
 
 ## 지원하는 입력 계약과 중단 조건
 
-이 계약은 **외부 exporter/loader 소스에서 확인한 형식**이다.
-공개 체크포인트 파일 내부에서 직접 확인한 결과가 아니다.
+이 계약은 외부 exporter/loader 소스와 공개 revision의 manifest·safetensors 헤더·통계
+JSON에서 확인했다. tensor payload 및 실제 모델/GPU 실행 검증은 남아 있다.
 
 ```text
 CHECKPOINT_DIR/
@@ -62,14 +65,17 @@ CHECKPOINT_DIR/
 `w8a8_config.json`에는 `quantization="w8a8_bitblas"`, `complete_model=true`,
 중복 없는 비어 있지 않은 `w8a8_layers` 목록이 있어야 한다. 계층명을 추정하거나
 정규식 기본값으로 대신하지 않는다. 목록의 모든 항목은 공식 모델의 실제 `nn.Linear`여야 한다.
-진단에 실제 이름·개수가 출력된다. 보고서의 180개는 비교용 예상값이며 강제값이 아니다.
+진단에 실제 이름·개수가 출력된다. 로컬 exporter의 후보는 두 transformer stack의
+252개 Linear이며 실제 모델 대조 전에는 확정된 대상이 아니다.
 
 각 대상은 raw INT8 `qweight` `[out_features, in_features]`, 양수·유한한 실수
 `weight_scale` `[out_features]`, 원본 계층에 bias가 있다면 `bias`가 필요하다.
 대상 이외의 **모든** 공식 persistent weight/buffer도 필요하다. 키 누락·추가,
 형상 불일치, 잘못된 dtype, 비유한 값은 GPU 초기화 전에 중단한다.
-공유 가중치 alias 키가 생략된 체크포인트도 임의 복원하지 않고 중단한다.
-실제 파일이 이 형식과 다르면 파일 구조를 확인한 뒤 별도 수정해야 한다.
+실제 모델이 PaliGemma `lm_head.weight`와 embedding을 공유할 때만 생략된 한쪽 키를
+다른 쪽에서 복원한다. 둘 다 존재하면서 값이 다르면 거부한다. 그 외 alias 누락은 중단한다.
+공개 180계층 checkpoint의 헤더/manifest는 이 계약과 일치한다. Expert attention
+72개는 BF16으로 남기며 후보 252개를 강제로 적용하지 않는다.
 
 정규화 통계는 공식 config의 asset ID에서 읽는다. `state`, `actions` 및
 mean/std와 π0.5 quantile 정규화용 q01/q99가 필수다. 각 통계는 유한한 같은 길이의
@@ -138,13 +144,13 @@ compile 활성 경로와 BitBLAS의 조합은 미검증이다.
 - 공식 transform factory는 PaliGemma tokenizer를 기존 download helper로 준비한다.
   서버 실행 전에 tokenizer 캐시를 준비한다. 이 전용 로더는 체크포인트를 자동 다운로드하지 않는다.
 - 체크포인트 revision·hash·정확한 config와 tensor key 목록, raw/packed 여부,
-  scale 형식, 공유 가중치 alias, 실제 180개 여부, 통계 길이·출처를 확인한다.
+  scale 형식, 공유 가중치 alias, 실제 대상 계층 개수, 통계 길이·출처를 확인한다.
 - 충분한 CPU/GPU 메모리가 필요하다. 현재는 공식 모델 초기 생성과 전체 state dict를
   CPU에 만들며 raw/packed INT8 weight를 둘 다 보관한다. peak RAM/VRAM은 미측정이다.
 - 장치별 CUDA/driver/PyTorch/BitBLAS/TVM 환경과 target 감지를 기록한다.
   A40 결과로 Orin의 ARM64/SM87 호환성·속도를 판단하지 않는다.
 
-## 이번 검증 범위와 미검증 항목
+## 초기 이식 검증 기록 (공개 metadata 확인 전)
 
 새 Python 파일의 AST/바이트코드 컴파일 및 정적 소스 검사를 수행했다.
 Python 3.12에서 Python 3.11 문법 기준 AST 검사와 메모리 내 컴파일을 수행했다.
@@ -152,19 +158,32 @@ Ruff가 로컬에 없어 Ruff lint/format은 수행하지 않았고 패키지를
 모델 다운로드, 모델 생성, GPU 커널 초기화·추론·LIBERO 평가, 패키지 설치,
 Git commit/push는 수행하지 않았다. 기존 공식 추적 파일도 변경하지 않았다.
 
-공개 체크포인트의 실제 내부 형식과 이 로더의 호환성, BitBLAS API/packing,
+2026-11-01 후속 점검에서는 공개 manifest·모델 문서·norm JSON·tensor 헤더만 읽었고,
+CPU 회귀 13개와 정적 검사가 통과했다. 전체 suite의 파일 저장 테스트는 로컬
+safetensors 부재로 실행하지 못했다. 상세 결과는 [PUBLIC_CHECKPOINT.md](PUBLIC_CHECKPOINT.md)에 있다.
+
+공개 체크포인트의 전체 tensor 값과 실제 모델 로딩 호환성, BitBLAS API/packing,
 모든 실제 입력 shape의 커널 실행, compile 호환성, 추론 정확도·속도·메모리,
 Orin 호환성은 모두 **실행 검증 전**이다. GPU 서버에서 실패 메시지를 확인하고
 형식을 확정한 다음 동일 조건의 FP 원본과 LIBERO 정확도·동기화된 latency를 비교한다.
 
 외부 원본과 로컬 수정의 상세 출처는 [NOTICE.md](NOTICE.md)를 참고한다.
 
+## 실제 체크포인트 검증 인계
+
+공개 checkpoint 우선 실행은 [PUBLIC_CHECKPOINT.md](PUBLIC_CHECKPOINT.md)를 따른다.
+아래 FP export 절차는 보존한 별도 경로이며 공개 W8A8 checkpoint에는 적용하지 않는다.
+
+로컬 FP 체크포인트 → 구조 대조 → CPU 양자화/저장/파일 재로딩 → GPU 전용 로더와
+실제 `policy.infer()` 실행 명령은 [CPU_HANDOFF.md](CPU_HANDOFF.md)의 후속 절차를 따른다.
+`scripts/validate_w8a8_forward.py`는 compile을 끈 스모크 테스트이며 정확도·속도 평가가 아니다.
+
 ## CPU 검증 회귀 테스트
 
 `weight_scale`은 로딩 대상 dtype으로 변환한 후에도 모든 값이 유한하고 0보다 커야 한다.
 변환에 의한 overflow/underflow도 거부한다. 헤더 진단에서 지원하는 scale dtype은
 `F16`, `BF16`, `F32`, `F64`이며, 실제 값 검증은 전체 로더에서 수행한다.
-공유 가중치 alias 키 누락 시 중단하는 기존 제한은 유지한다.
+검증된 PaliGemma lm_head/embedding 쌍 이외의 공유 가중치 alias 누락은 중단한다.
 
 저장소 루트에서 다음과 같이 실행한다. `unittest`와 기존 CPU PyTorch만 사용한다.
 

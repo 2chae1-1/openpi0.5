@@ -5,6 +5,7 @@
 
 import dataclasses
 import json
+import logging
 import pathlib
 
 import numpy as np
@@ -31,6 +32,36 @@ def read_manifest(checkpoint_dir: pathlib.Path | str) -> list[str]:
     if not (path / "model.safetensors").is_file():
         raise FileNotFoundError(path / "model.safetensors")
     return names
+
+
+def prepare_checkpoint_state(model, state: dict) -> None:
+    """Normalize only known nonpersistent buffers and the model's verified tied pair.
+
+    safetensors.save_model may omit either alias. Other missing keys remain errors.
+    Mutates the supplied dictionary without copying weight tensors.
+    """
+    expected = model.state_dict()
+    optional_buffers = (
+        "paligemma_with_expert.gemma_expert.model.rotary_emb.inv_freq",
+        "paligemma_with_expert.paligemma.model.language_model.rotary_emb.inv_freq",
+        "paligemma_with_expert.paligemma.model.vision_tower.vision_model.embeddings.position_ids",
+    )
+    for key in optional_buffers:
+        if key not in expected:
+            state.pop(key, None)
+    head = "paligemma_with_expert.paligemma.lm_head.weight"
+    embedding = "paligemma_with_expert.paligemma.model.language_model.embed_tokens.weight"
+    if head not in expected or embedding not in expected:
+        return
+    if model.get_parameter(head) is not model.get_parameter(embedding):
+        return  # No alias restoration unless the actual architecture ties these weights.
+    if head in state and embedding not in state:
+        state[embedding] = state[head]
+    elif embedding in state and head not in state:
+        state[head] = state[embedding]
+    elif head in state and embedding in state:
+        if state[head].dtype != state[embedding].dtype or not torch.equal(state[head], state[embedding]):
+            raise ValueError("Conflicting checkpoint values for tied lm_head/embedding")
 
 
 def validate_state_dict(model, state: dict, names: list[str]) -> None:
@@ -111,6 +142,7 @@ def load_w8a8_policy(
     from openpi.training import config
 
     names = read_manifest(checkpoint_dir)
+    logging.info("W8A8 manifest accepted: %d explicit layers", len(names))
     train_config = config.get_config("pi05_libero")
     if disable_compile_for_validation:
         train_config = dataclasses.replace(
@@ -118,40 +150,27 @@ def load_w8a8_policy(
         )
     data_config = train_config.data.create(train_config.assets_dirs, train_config.model)
     norm_stats = load_norm_stats(checkpoint_dir, data_config)
+    logging.info("W8A8 normalization statistics validated")
     model = PI0Pytorch(train_config.model)
     # Convert before replacement so checkpoint scales never pass through BF16.
     model.paligemma_with_expert.to_bfloat16_for_selected_params("bfloat16")
     replace_w8a8_layers(model, names)
     state = load_file(str(pathlib.Path(checkpoint_dir) / "model.safetensors"), device="cpu")
 
-    # Remove only known non-persistent positional buffers.
-    optional_buffers = (
-        "paligemma_with_expert.gemma_expert.model.rotary_emb.inv_freq",
-        "paligemma_with_expert.paligemma.model.language_model.rotary_emb.inv_freq",
-        "paligemma_with_expert.paligemma.model.vision_tower.vision_model.embeddings.position_ids",
-    )
-    for key in optional_buffers:
-        state.pop(key, None)
-
-    # Restore the missing tied lm_head key from its shared embedding.
-    lm_head_key = "paligemma_with_expert.paligemma.lm_head.weight"
-    embedding_key = (
-        "paligemma_with_expert.paligemma.model.language_model.embed_tokens.weight"
-    )
-    if lm_head_key not in state:
-        if embedding_key not in state:
-            raise ValueError(f"Missing tied embedding: {embedding_key}")
-        state[lm_head_key] = state[embedding_key]
-
+    prepare_checkpoint_state(model, state)
     validate_state_dict(model, state, names)
     model.load_state_dict(state, strict=True)
+    logging.info("W8A8 strict checkpoint load passed: %d layers; scales loaded as FP32", len(names))
     del state
     model.to(device).eval()
+    initialized = 0
     for module in model.modules():
         if isinstance(module, BitBLASW8A8Linear):
             # Scales remain FP32 at runtime; packing is separate from checkpoint qweight.
             module.weight_scale = module.weight_scale.float()
             module.initialize_kernel(opt_m=opt_m, enable_tuning=enable_tuning)
+            initialized += 1
+            logging.info("W8A8 INT8 probe passed [%d/%d]: %s", initialized, len(names), module.name)
     diagnostics = w8a8_diagnostics(model)
     if diagnostics["layer_count"] != len(names) or not diagnostics["all_int8_probes_passed"]:
         raise RuntimeError("Incomplete W8A8 initialization")

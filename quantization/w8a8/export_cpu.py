@@ -32,7 +32,7 @@ def main():
     from quantize_cpu import quantize_linear_weights
     from openpi.models_pytorch.pi0_pytorch import PI0Pytorch
     from openpi.models_pytorch.bitblas_w8a8_layers import replace_w8a8_layers
-    from openpi.policies.w8a8_policy import load_norm_stats, validate_state_dict
+    from openpi.policies.w8a8_policy import load_norm_stats, prepare_checkpoint_state, validate_state_dict
     from openpi.training import config
 
     source = args.source.resolve(strict=True)
@@ -79,6 +79,11 @@ def main():
     for name in names:
         if not isinstance(model.get_submodule(name), torch.nn.Linear):
             raise TypeError(f"Target is not an actual Linear: {name}")
+    target_report = [
+        {"name": name, "in_features": model.get_submodule(name).in_features,
+         "out_features": model.get_submodule(name).out_features}
+        for name in names
+    ]
 
     # Match the existing pi05_libero loader's documented assets contract.
     asset_id = "physical-intelligence/libero"
@@ -87,37 +92,42 @@ def main():
     print(f"Architecture targets and normalization statistics checked: {len(names)} layers", flush=True)
     print("Loading local weights on CPU; full checkpoint RAM is required.", flush=True)
     state = load_file(str(weights_path), device="cpu")
-    optional = (
-        "paligemma_with_expert.gemma_expert.model.rotary_emb.inv_freq",
-        "paligemma_with_expert.paligemma.model.language_model.rotary_emb.inv_freq",
-        "paligemma_with_expert.paligemma.model.vision_tower.vision_model.embeddings.position_ids",
-    )
-    expected_keys = set(model.state_dict())
-    for key in optional:
-        if key not in expected_keys:
-            state.pop(key, None)
     head = "paligemma_with_expert.paligemma.lm_head.weight"
     embedding = "paligemma_with_expert.paligemma.model.language_model.embed_tokens.weight"
-    restored_head = head not in state
-    if restored_head:
-        if embedding not in state:
-            raise ValueError("Missing tied embedding for lm_head restoration")
-        state[head] = state[embedding]
+    original_alias_keys = {key for key in (head, embedding) if key in state}
+    prepare_checkpoint_state(model, state)
     validate_state_dict(model, state, [])
     converted = quantize_linear_weights(state, names)
     del state
     with torch.device("meta"):
         replace_w8a8_layers(model, names)
     validate_state_dict(model, converted, names)
-    del model
     # Retain the source's omitted alias convention; the loader restores it.
-    if restored_head:
-        del converted[head]
+    for key in (head, embedding):
+        if key not in original_alias_keys:
+            converted.pop(key, None)
 
     staging = Path(tempfile.mkdtemp(prefix=output.name + ".partial-", dir=output.parent))
     try:
         save_file(converted, str(staging / "model.safetensors"))
+        # Compare the actual serialized payload one tensor at a time, without
+        # allocating a second complete checkpoint in RAM.
+        from safetensors import safe_open
+
+        with safe_open(str(staging / "model.safetensors"), framework="pt", device="cpu") as saved:
+            if set(saved.keys()) != set(converted):
+                raise ValueError("Saved checkpoint keys differ from converted state")
+            for key, expected in converted.items():
+                actual = saved.get_tensor(key)
+                if actual.dtype != expected.dtype or not torch.equal(actual, expected):
+                    raise ValueError(f"Saved checkpoint round-trip mismatch: {key}")
+            del actual, expected
         del converted
+        # Reuse the loader's full validation against the replaced architecture.
+        reloaded = load_file(str(staging / "model.safetensors"), device="cpu")
+        prepare_checkpoint_state(model, reloaded)
+        validate_state_dict(model, reloaded, names)
+        del reloaded, model
         destination_stats = staging / "assets" / asset_id
         destination_stats.mkdir(parents=True)
         shutil.copy2(stats_dir / "norm_stats.json", destination_stats / "norm_stats.json")
@@ -126,12 +136,15 @@ def main():
             "complete_model": True,
             "model_type": "pi05_libero",
             "w8a8_layers": names,
+            "validated_target_shapes": target_report,
             "weight_format": "raw_int8_out_in",
             "weight_scale_dtype": "float32",
             "source_checkpoint": str(source),
             "validation": {
                 "architecture_keys_shapes_and_values": True,
                 "normalization_statistics": True,
+                "serialized_tensor_roundtrip": True,
+                "saved_state_validated_against_architecture": True,
                 "full_model_load_executed": False,
                 "gpu_kernel_executed": False,
                 "accuracy_evaluated": False,

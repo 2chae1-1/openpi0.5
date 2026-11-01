@@ -14,12 +14,21 @@
   complete checkpoint loading concepts. Removed W8FP16, fallback, download/upload,
   capture and persistent tuning cache. Added strict validation, separate raw/packed
   weights, integer kernel probes and diagnostics; retained official model and policy behavior.
+  Updated on 2026-11-01: shared exporter/loader checkpoint preparation now verifies
+  the actual tied lm_head/embedding pair before restoring either omitted alias,
+  rejects conflicting tied values, and retains expected persistent buffers.
 - `scripts/inspect_w8a8.py` is a new diagnostic entry point, not the external LIBERO evaluator.
 - Existing OpenPI `LICENSE` and `LICENSE_GEMMA.txt` remain applicable and unchanged.
 - BitBLAS is an external runtime dependency, not vendored here. Its upstream project
   is [microsoft/BitBLAS](https://github.com/microsoft/BitBLAS) (MIT).
   A working BitBLAS/TVM build revision is **not verified or pinned** by this port.
 - Candidate checkpoint: [fatdove/pi05-libero-w8a8](https://huggingface.co/fatdove/pi05-libero-w8a8).
-  Earlier report recorded revision `2c9896f69be4a7dc7d7604688de3cd9e6a8ebeee`.
-  No model files were downloaded or inspected for this implementation; checkpoint
-  format, provenance and applicable model terms still require verification.
+  Revision `2c9896f69be4a7dc7d7604688de3cd9e6a8ebeee` verified via Hub API on 2026-11-01.
+  Public model card declares Apache-2.0; original OpenPI/Gemma terms remain relevant.
+  `reference/` preserves the public model card, manifest, normalization statistics and
+  HTTP Range-only safetensors header (no tensor payload). Sources, SHA256 hashes and
+  inspection limits are recorded in `PUBLIC_CHECKPOINT.md`. These are external metadata,
+  not locally authored model weights or evidence of verified training provenance.
+  The public 180-layer format matches the existing loader contract; added loading/probe
+  progress logs and CPU compatibility regressions without changing quantization math.
+  Actual full-checkpoint loading, GPU/Jetson execution and LIBERO evaluation remain unverified.
