@@ -1,0 +1,87 @@
+{
+  "schema_version": 1,
+  "created_at_utc": "2026-11-01T16:09:29.984508+00:00",
+  "status": "unverified",
+  "config_name": "pi05_libero",
+  "checkpoint_dir": "checkpoints/pi05_libero_pytorch",
+  "device": "cuda",
+  "requested_prune_fraction": 0.1,
+  "multiple_of": 1,
+  "before": null,
+  "after": null,
+  "outputs": {
+    "before": {
+      "status": "unverified",
+      "shape": null
+    },
+    "after": {
+      "status": "unverified",
+      "shape": null
+    },
+    "input_kind": "synthetic_preprocessed_observation_fixed_noise",
+    "num_steps": 10,
+    "batch_size": 1,
+    "seed": 123
+  },
+  "artifacts": {
+    "manifest": {
+      "status": "not_saved"
+    },
+    "state_dict": {
+      "status": "not_saved"
+    }
+  },
+  "verification": {
+    "original_checkpoint_loaded": false,
+    "physical_pruning": false,
+    "output_shapes_match": null,
+    "restore_roundtrip": {
+      "status": "unverified"
+    },
+    "libero_accuracy": {
+      "status": "unverified",
+      "reason": "No LIBERO evaluation is performed."
+    }
+  },
+  "memory_definition": "Unique parameter numel * element_size; excludes buffers, activations, KV cache and allocator overhead.",
+  "notes": [
+    "Training-free weight-magnitude heuristic; no calibration, gradients or fine-tuning.",
+    "Only Action Expert gated FFN intermediate channels are removed.",
+    "Output shapes are raw model actions, before LIBERO policy postprocessing."
+  ],
+  "preflight": {
+    "python": "3.10.11",
+    "torch": "2.12.0+cpu",
+    "cuda_available": false,
+    "cuda_device_count": 0,
+    "modules": {
+      "openpi": false,
+      "safetensors": false,
+      "transformers": false,
+      "jax": false,
+      "flax": false
+    },
+    "remote_checkpoint_not_inspected": false,
+    "local_pytorch_weights_found": false,
+    "issues": [
+      "OpenPI requires Python >=3.11.",
+      "Missing dependency: openpi (install the repository environment).",
+      "Missing dependency: safetensors (install the repository environment).",
+      "Missing dependency: transformers (install the repository environment).",
+      "Missing dependency: jax (install the repository environment).",
+      "Missing dependency: flax (install the repository environment).",
+      "CUDA is unavailable; GPU inference has not been verified.",
+      "Missing PyTorch checkpoint: checkpoints\\pi05_libero_pytorch\\model.safetensors. JAX params are not accepted; convert with examples/convert_jax_model_to_pytorch.py --config-name pi05_libero first."
+    ]
+  },
+  "unverified_reasons": [
+    "OpenPI requires Python >=3.11.",
+    "Missing dependency: openpi (install the repository environment).",
+    "Missing dependency: safetensors (install the repository environment).",
+    "Missing dependency: transformers (install the repository environment).",
+    "Missing dependency: jax (install the repository environment).",
+    "Missing dependency: flax (install the repository environment).",
+    "CUDA is unavailable; GPU inference has not been verified.",
+    "Missing PyTorch checkpoint: checkpoints\\pi05_libero_pytorch\\model.safetensors. JAX params are not accepted; convert with examples/convert_jax_model_to_pytorch.py --config-name pi05_libero first."
+  ]
+}

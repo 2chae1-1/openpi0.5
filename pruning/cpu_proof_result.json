@@ -1,0 +1,100 @@
+{
+  "method": "training_free_magnitude_structured_ffn",
+  "target": "expert",
+  "requested_keep_fraction": 0.75,
+  "multiple_of": 4,
+  "model_parameters_before": 768,
+  "model_parameters_after": 576,
+  "parameters_removed": 192,
+  "model_parameter_reduction_pct": 25.0,
+  "layers": [
+    {
+      "part": "expert",
+      "layer": 0,
+      "original_intermediate": 16,
+      "new_intermediate": 12,
+      "removed_channels": 4,
+      "kept_indices": [
+        0,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        12,
+        13,
+        14,
+        15
+      ],
+      "score": "l2_gate_times_l2_up_times_l2_down"
+    },
+    {
+      "part": "expert",
+      "layer": 1,
+      "original_intermediate": 16,
+      "new_intermediate": 12,
+      "removed_channels": 4,
+      "kept_indices": [
+        0,
+        1,
+        2,
+        3,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12
+      ],
+      "score": "l2_gate_times_l2_up_times_l2_down"
+    }
+  ],
+  "tensor_bytes_before": 3072,
+  "tensor_bytes_after": 2304,
+  "test_model": "tiny_randomly_initialized_gemma_style_mlp_only_NOT_pi05_checkpoint",
+  "gpu_measured": false,
+  "libero_measured": false,
+  "real_tensor_compaction_single_fullsize_gemma_expert_ffn_random_weights": {
+    "shape_before": [
+      1024,
+      4096,
+      1024
+    ],
+    "shape_after": [
+      1024,
+      3072,
+      1024
+    ],
+    "parameters_before": 12582912,
+    "parameters_after": 9437184,
+    "bf16_tensor_bytes_before": 25165824,
+    "bf16_tensor_bytes_after": 18874368,
+    "note": "ACTUAL tensor sizes after real slicing, but random weights not pi05_libero weights."
+  },
+  "analytical_pi05_expert_mlp_if_25pct_pruned": {
+    "hidden_size": 1024,
+    "intermediate_before": 4096,
+    "intermediate_after": 3072,
+    "layers": 18,
+    "ffn_weights_before": 226492416,
+    "ffn_weights_after": 169869312,
+    "ffn_weights_removed": 56623104,
+    "estimated_bf16_weight_bytes_reduced": 113246208,
+    "note": "Analytical (NOT actual checkpoint compression, accuracy, VRAM or runtime benchmark)."
+  },
+  "analytical_pi05_language_ffn_if_25pct_pruned": {
+    "hidden_size": 2048,
+    "intermediate_before": 16384,
+    "intermediate_after": 12288,
+    "layers": 18,
+    "ffn_weights_before": 1811939328,
+    "ffn_weights_after": 1358954496,
+    "ffn_weights_removed": 452984832,
+    "estimated_bf16_weight_bytes_reduced": 905969664,
+    "note": "Analytical (NOT actual trained pi05 checkpoint, accuracy, VRAM or runtime measurement)."
+  }
+}
