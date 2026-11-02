@@ -20,7 +20,8 @@
   없을 때만 `uv pip install --python .venv/bin/python nvidia-ml-py`로 설치한다.
   모듈/드라이버/권한상 측정 불가인 값은 `null`과 이유를 남긴다.
 - PaliGemma tokenizer 캐시를 준비한다. 캐시가 없으면 기존 OpenPI transform이 최초 다운로드를 시도한다.
-  체크포인트는 자동 다운로드하지 않는다. LIBERO 평가 환경·assets·EGL·ffmpeg는 필요 없다.
+  체크포인트는 자동 다운로드하지 않는다. LIBERO 시뮬레이터·평가용 assets·EGL·ffmpeg는 필요 없다.
+  단, 아래 checkpoint의 `assets/physical-intelligence/libero/norm_stats.json`은 필수다.
 
 체크포인트 디렉터리는 다음 구조여야 한다. 기존 로더의 strict tensor 검증과 정규화 통계 검증을 그대로 사용한다.
 
@@ -31,13 +32,15 @@ checkpoints/pi05-libero-w8a8-public/
   assets/physical-intelligence/libero/norm_stats.json
 ```
 
-공개 모델이 아직 없으면 저장소 루트에서 한 번 내려받는다. 아래 revision은 기존 인계 문서에 기록된 값이다.
+체크포인트가 아직 로컬에 없으면 저장소 루트에서 한 번 내려받는다. 아래 고정 revision의 파일 목록을 확인했다.
+실제 모델 로딩과 GPU 호환성 검증은 별도로 필요하다. `README.md`도 받아 모델 카드와 라이선스 선언을 보존한다.
 
 ```bash
 uvx --from huggingface_hub hf download fatdove/pi05-libero-w8a8 \
+  model.safetensors w8a8_config.json \
+  assets/physical-intelligence/libero/norm_stats.json README.md \
   --revision 2c9896f69be4a7dc7d7604688de3cd9e6a8ebeee \
-  --local-dir checkpoints/pi05-libero-w8a8-public \
-  --include model.safetensors w8a8_config.json assets/physical-intelligence/libero/norm_stats.json
+  --local-dir checkpoints/pi05-libero-w8a8-public
 ```
 
 ## 복사해서 실행할 명령
@@ -101,11 +104,10 @@ NVML 값의 정의는 [NVIDIA NVML API](https://docs.nvidia.com/deploy/nvml-api/
 NVML만 측정 불가여도 모델 검증은 계속하며 `memory.nvml.status`와 `errors`를 반드시 함께 확인한다.
 출력 폴더 전체를 팀에 전달하면 된다. 실제 GPU 측정값은 서버에서 실행한 뒤에만 보고한다.
 
-## Windows CPU 검사
+## 기존 Windows CPU 검사 기록
 
-```powershell
-python -B -m unittest discover -s quantization/w8a8 -p test_benchmark.py -v
-```
-
-표준 라이브러리 `unittest`와 기존 CPU PyTorch/NumPy로 보고서, FP 생략, 실패 보존,
-INT8 호출 계측, NVML 대체 객체를 검사한다. 전체 모델·CUDA·실제 BitBLAS는 실행하지 않는다.
+최소 GPU 전달본에서는 실행 중 호출하지 않는 CPU 회귀 테스트 파일을 제외했다.
+[기존 테스트 원본](https://github.com/2chae1-1/openpi0.5/blob/b9965ddea250f1191b9411a2a5d12c6896e911de/quantization/w8a8/test_benchmark.py)은
+보고서, FP 생략, 실패 보존, INT8 호출 계측, NVML 대체 객체를 검사한다.
+기존 21개 통과 기록은 [GPU 인계 문서](../../GPU_HANDOFF.md#6-기존-로컬-검증-기록과-gpu-검증-범위)에 설명한다.
+CPU 검사 기록은 전체 모델·CUDA·실제 BitBLAS 검증 결과가 아니다.

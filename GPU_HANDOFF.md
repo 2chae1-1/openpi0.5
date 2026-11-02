@@ -14,8 +14,10 @@ Windows CPU 회귀 검사 통과를 GPU 성공으로 해석하면 안 된다.
 git fetch origin
 git switch handoff/libero-w8a8
 git pull --ff-only
-git submodule update --init --recursive
 ```
+
+이번 고정 관측 벤치마크에는 LIBERO/ALOHA 시뮬레이터 submodule 초기화가 필요하지 않다.
+저장소의 `.gitmodules`와 submodule 포인터는 그대로 보존한다.
 
 - Linux, Bash, `tee`, `mktemp`, NVIDIA GPU와 CUDA 사용 가능한 드라이버가 필요하다.
   저장소의 기존 기준 환경은 Python 3.11, PyTorch 2.7.1, Transformers 4.53.2다.
@@ -73,6 +75,7 @@ checkpoints/pi05-libero-w8a8-public/
   model.safetensors
   w8a8_config.json
   assets/physical-intelligence/libero/norm_stats.json
+  README.md  # Hugging Face 모델 카드와 출처·라이선스 정보
 ```
 
 이것은 임의 INT8 state dict가 아니라 `pi05_libero` **전체 W8A8 체크포인트**여야 한다.
@@ -80,12 +83,34 @@ manifest는 `quantization="w8a8_bitblas"`, `complete_model=true`, 중복 없는 
 기존 로더가 전체 key·shape·dtype, INT8 qweight, 양수/유한 scale, 정규화 통계와 strict load를 검증한다.
 검증을 통과시키려고 manifest를 임의로 만들거나 누락된 가중치를 FP32로 대체하지 않는다.
 
-공개 체크포인트 다운로드 명령과 기존에 기록된 revision은
-[기존 체크포인트 안내](examples/libero/README.md#서버-준비)와
-[NOTICE](quantization/w8a8/NOTICE.md)에 있다. 이 revision은 기존 조사 기록이며 실제 GPU 호환성 증거는 아니다.
+체크포인트가 아직 로컬에 없으면 저장소 루트에서 다음 명령으로 한 번 받는다.
+공개 저장소는 [fatdove/pi05-libero-w8a8](https://huggingface.co/fatdove/pi05-libero-w8a8)이며,
+revision `2c9896f69be4a7dc7d7604688de3cd9e6a8ebeee`의 파일 목록과 metadata를 확인했다.
+이는 전체 가중치 다운로드·로딩 또는 GPU 호환성 검증을 뜻하지 않는다.
+
+```bash
+uvx --from huggingface_hub hf download fatdove/pi05-libero-w8a8 \
+  model.safetensors w8a8_config.json \
+  assets/physical-intelligence/libero/norm_stats.json README.md \
+  --revision 2c9896f69be4a7dc7d7604688de3cd9e6a8ebeee \
+  --local-dir checkpoints/pi05-libero-w8a8-public
+```
+
+실행 필수 파일은 가중치·설정·정규화 통계 3개다. `README.md`는 모델 카드와 라이선스 선언 보존용이다.
+가중치는 5,266,572,696 bytes(약 5.27 GB)이며 Git 브랜치와 별도로 다운로드한다.
+파일명은 `--include` 뒤에 나열하지 않고 위처럼 저장소 ID 뒤의 개별 인자로 지정한다.
+최신 `hf` CLI의 반복 옵션 해석 차이로 가중치가 빠지는 일을 피하기 위한 형식이다.
+
+**`assets/physical-intelligence/libero/norm_stats.json`은 필수 정규화 통계다.**
+생략 가능한 LIBERO 시뮬레이터 assets와 다른 파일이다. 같은 checkpoint revision의 파일을
+위 하위 경로 그대로 두며, 빈 통계나 임의의 다른 모델 통계로 대체하지 않는다.
+PaliGemma tokenizer는 체크포인트의 이 세 파일과 별개로 1절의 캐시 준비가 필요하다.
+
 이미 받은 체크포인트를 재사용할 수 있고, 다른 위치면 `W8A8_CHECKPOINT`만 지정한다.
-실제 출처를 확인한 경우에만 `W8A8_REVISION`에 해당 revision을 기록한다.
+위 고정 revision으로 받은 출처를 확인한 경우에만 `W8A8_REVISION`에 해당 revision을 기록한다.
 벤치마크와 셸 스크립트는 체크포인트를 자동 다운로드하거나 변환하지 않는다.
+저장소의 `LICENSE`, `LICENSE_GEMMA.txt`, [NOTICE](quantization/w8a8/NOTICE.md),
+`quantization/w8a8/LICENSE.openpi_duquant` 및 기존 소스의 고지를 보존한다.
 
 ## 3. 실행 명령
 
@@ -199,34 +224,36 @@ Python/로그 기록이 실패하면 셸은 첫 실패에서 중단하고 0이 �
 원인을 해결한 뒤 같은 명령으로 새 batch를 실행한다. 커널 캐시·GPU 온도·다른 프로세스는
 새 프로세스로 초기화되지 않으므로 실험 당시 GPU 상태도 함께 기록한다.
 
-## 5. 기존 W8A8 파일 6개 검토
+## 5. 전달 파일 유지 범위
 
-| 기존 파일 | 구분 | 역할 / 유지 판단 |
+| 파일 | 구분 | 역할 / 유지 판단 |
 | --- | --- | --- |
+| `scripts/run_w8a8_gpu.sh` | 실행 필수 | 기존 벤치마크를 독립 프로세스로 기본 3회 호출 |
 | `scripts/benchmark_pi05_fp_w8a8.py` | 실행 필수 | CLI, 새 CUDA worker, 측정 및 JSON/CSV/로그 생성 |
 | `src/openpi/policies/w8a8_policy.py` | 실행 필수 | manifest·정규화·체크포인트 strict 검증과 policy 로딩 |
 | `src/openpi/models_pytorch/bitblas_w8a8_layers.py` | 실행 필수 | INT8 가중치/활성화, BitBLAS INT32 연산, 정수 probe 및 진단 |
-| `quantization/w8a8/test_benchmark.py` | 테스트 | CPU 회귀 검사; GPU 실행 시 직접 호출하지 않지만 유지 |
 | `quantization/w8a8/NOTICE.md` | 출처 문서 | 외부 출처·변경·체크포인트·미검증 사항 기록; 유지 |
 | `quantization/w8a8/LICENSE.openpi_duquant` | 외부 라이선스 | Apache-2.0 원문; 유지 필수 |
 
-역할이 다른 파일이므로 삭제할 중복 구현은 없다. 6개 모두 그대로 유지한다.
+GPU 전달본에서는 실행 중 호출하지 않는 CPU 회귀 테스트 파일을 제외했다.
+테스트 원본과 기존 검증 기록은 아래 고정 commit 링크에서 확인할 수 있다.
+`.gitattributes`는 셸의 LF 줄바꿈을 유지하므로 보존한다.
 기존 [측정 상세 문서](examples/libero/README.md)는 직접 Python CLI 사용법과 결과 해석의 참고 자료로 유지한다.
-위 실행 필수 3개만 복사하면 되는 것은 아니다. 전체 OpenPI 소스·의존성·공식 Transformers 교체 파일과
-기존 `LICENSE`, `LICENSE_GEMMA.txt`도 필요하다. 새 셸은 기존 CLI의 실행만 조정한다.
+위 실행 필수 4개만 복사하면 되는 것은 아니다. 전체 OpenPI 소스·의존성·공식 Transformers 교체 파일과
+`packages/openpi-client/`, `pyproject.toml`, `uv.lock`, `.python-version`, `README.md`,
+기존 `LICENSE`, `LICENSE_GEMMA.txt`도 보존한다. 새 셸은 기존 CLI의 실행만 조정한다.
+`scripts/serve_policy.py`는 이 벤치마크가 호출하지 않지만 기존 서버와 Docker 진입점이므로 유지한다.
 
-## 6. 로컬 검증 범위
+## 6. 기존 로컬 검증 기록과 GPU 검증 범위
 
-Windows CPU 회귀 검사는 다음 명령으로 실행한다.
+기존 commit `b9965ddea250f1191b9411a2a5d12c6896e911de`에 기록된 Windows CPU 회귀 검사에서는
+21개가 통과했다. [당시 테스트 원본](https://github.com/2chae1-1/openpi0.5/blob/b9965ddea250f1191b9411a2a5d12c6896e911de/quantization/w8a8/test_benchmark.py)은
+보고서·FP 생략·실패 보존·INT8 호출 계측·NVML 대체 객체 등을 검사한다.
+이는 기존 기록이며 이번 최소 전달본에서 테스트를 새로 실행했다는 의미는 아니다.
 
-```powershell
-python -B -m unittest discover -s quantization/w8a8 -p test_benchmark.py -v
-```
-
-CPU 테스트는 보고서·FP 생략·실패 보존·INT8 호출 계측·NVML 대체 객체 등을 검사한다.
-이번 변경에서 기존 CPU 테스트 21개가 모두 통과했다. Git Bash 문법 검사와 대체 실행기로
-기본 3회 반복, 설정 전달, 결과 격리/재실행 보존, 첫 실패 중단 및 종료 코드 보존도 확인했다.
+기존 기록에는 Git Bash 문법 검사와 대체 실행기의 기본 3회 반복, 설정 전달,
+결과 격리/재실행 보존, 첫 실패 중단 및 종료 코드 보존 확인도 포함된다.
 실제 벤치마크의 체크포인트 누락 경로에서 부분 JSON/CSV/로그와 종료 코드 1을 확인했다.
-로컬 CPU 검사는 Python 3.10.11 / PyTorch 2.12.0+cpu 환경이며 위 운영 기준 환경과는 다르다.
-실제 모델 체크포인트 로딩, CUDA/BitBLAS 연산, GPU 수치 및 LIBERO 품질을 검증하는 테스트가 아니다.
+당시 로컬 CPU 환경은 Python 3.10.11 / PyTorch 2.12.0+cpu로 위 운영 기준 환경과 다르다.
+실제 모델 체크포인트 로딩, CUDA/BitBLAS 연산, GPU 수치 및 LIBERO 품질은 검증하지 않았다.
 GPU 담당자는 서버에서 생성한 결과와 실패 로그를 근거로 검증 상태를 갱신한다.
