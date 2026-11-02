@@ -1,0 +1,2 @@
+# Preserve Bash syntax when this Windows-developed script is checked out on Linux.
+scripts/run_w8a8_gpu.sh text eol=lf
