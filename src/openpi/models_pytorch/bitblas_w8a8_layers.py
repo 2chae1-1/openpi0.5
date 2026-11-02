@@ -4,8 +4,119 @@
 # ruff: noqa: PLC0415 -- BitBLAS is imported only when initializing CUDA kernels.
 """Inference-only W8A8 Linear. No floating point matmul fallback."""
 
+import contextlib
+import importlib.metadata
+import logging
+import os
+import sys
+
 import torch
 from torch import nn
+
+_LOGGER = logging.getLogger(__name__)
+_BITBLAS_LOGGERS = (
+    "bitblas.ops.operator",
+    "bitblas.base.tuner",
+    "bitblas.base.utils",
+    "bitblas.relax.transform.apply_fast_tuning",
+    "bitblas.tl.tuner",
+    "bitblas.builder.lib_generator",
+    "bitblas.utils.target_detector",
+)
+
+
+class _BitBLASErrorCapture(logging.Handler):
+    """Recover exceptions while BitBLAS is still inside its swallowing except block."""
+
+    def __init__(self, layer_name: str):
+        super().__init__(logging.DEBUG)
+        self.layer_name = layer_name
+        self.first_error = None
+        self.error_count = 0
+
+    def emit(self, record: logging.LogRecord) -> None:
+        # Some 0.1.0.post1 tuning logs pass an exception without a %s placeholder.
+        try:
+            message = record.getMessage()
+        except (TypeError, ValueError):
+            message = f"{record.msg!s} args={record.args!r}"
+        exception = record.exc_info if record.exc_info and record.exc_info[0] else sys.exc_info()
+        if exception[0] is not None:
+            self.error_count += 1
+            if self.first_error is None:
+                self.first_error = f"{exception[0].__name__}: {exception[1]}"
+            _LOGGER.error(
+                "BitBLAS internal exception #%d layer=%s source=%s:%d: %s",
+                self.error_count,
+                self.layer_name,
+                record.name,
+                record.lineno,
+                message,
+                exc_info=exception,
+            )
+        else:
+            # Keep non-exception DEBUG evidence (including subprocess build errors)
+            # visible through the benchmark worker's INFO handler, too.
+            _LOGGER.log(
+                max(record.levelno, logging.INFO),
+                "BitBLAS %s layer=%s source=%s:%d: %s",
+                record.levelname,
+                self.layer_name,
+                record.name,
+                record.lineno,
+                message,
+            )
+
+
+@contextlib.contextmanager
+def _capture_bitblas_errors(layer_name: str, *, enabled: bool):
+    """Temporarily expose post1's hidden build tracebacks, without patching its code.
+
+    Loading initializes layers sequentially. Logging changes apply only for this
+    initialization scope and are restored even if construction/packing fails.
+    """
+    capture = _BitBLASErrorCapture(layer_name)
+    states = []
+    try:
+        if enabled:
+            for name in _BITBLAS_LOGGERS:
+                logger = logging.getLogger(name)
+                states.append((logger, logger.level, logger.propagate, logger.disabled, logger.handlers[:]))
+                logger.setLevel(logging.DEBUG)
+                logger.propagate = False
+                logger.disabled = False
+                logger.handlers = [capture]
+        yield capture
+    finally:
+        for logger, level, propagate, disabled, handlers in reversed(states):
+            logger.handlers = handlers
+            logger.disabled = disabled
+            logger.propagate = propagate
+            logger.setLevel(level)
+        capture.close()
+
+
+def _log_bitblas_environment(bitblas, device) -> None:
+    try:
+        version = importlib.metadata.version("bitblas")
+    except importlib.metadata.PackageNotFoundError:
+        version = getattr(bitblas, "__version__", "unknown")
+    tvm = sys.modules.get("tvm")
+    _LOGGER.info(
+        "BitBLAS diagnostic environment: bitblas=%s bitblas_file=%s tvm=%s tvm_file=%s "
+        "torch=%s torch_cuda=%s device=%s gpu=%s capability=%s CUDA_HOME=%s CUDA_PATH=%s",
+        version,
+        getattr(bitblas, "__file__", None),
+        getattr(tvm, "__version__", None),
+        getattr(tvm, "__file__", None),
+        torch.__version__,
+        torch.version.cuda,
+        device,
+        torch.cuda.get_device_name(device),
+        torch.cuda.get_device_capability(device),
+        os.environ.get("CUDA_HOME"),
+        os.environ.get("CUDA_PATH"),
+    )
 
 
 class BitBLASW8A8Linear(nn.Module):
@@ -29,6 +140,8 @@ class BitBLASW8A8Linear(nn.Module):
         self.forward_calls = 0
         self.last_activation_dtype = None
         self.last_output_dtype = None
+        self.kernel_stage = "not_initialized"
+        self.kernel_error = None
 
     @property
     def weight(self) -> torch.Tensor:
@@ -45,17 +158,33 @@ class BitBLASW8A8Linear(nn.Module):
         self.last_activation_dtype = None
         self.last_output_dtype = None
         self._packed_weight = None
+        self.kernel_stage = "preflight"
+        self.kernel_error = None
         if self.qweight.device.type != "cuda":
             raise RuntimeError(f"{self.name}: W8A8 requires CUDA weights; CPU fallback is disabled")
         if not opt_m or any(type(m) is not int or m <= 0 for m in opt_m):
             raise ValueError("opt_m must contain positive integers")
+        diagnostics = os.environ.get("OPENPI_BITBLAS_DIAGNOSTICS") == "1"
+        target = None
+        config = None
+        capture = None
         try:
+            self.kernel_stage = "bitblas_import"
+            import bitblas
             from bitblas.ops import Matmul
             from bitblas.ops import MatmulConfig
             from bitblas.utils import auto_detect_nvidia_target
 
-            with torch.cuda.device(self.qweight.device):
+            with (
+                torch.cuda.device(self.qweight.device),
+                _capture_bitblas_errors(self.name, enabled=diagnostics) as capture,
+            ):
+                if diagnostics:
+                    _log_bitblas_environment(bitblas, self.qweight.device)
+                self.kernel_stage = "target_detection"
                 target = auto_detect_nvidia_target()
+                self.kernel_target = str(target)
+                self.kernel_stage = "matmul_config"
                 config = MatmulConfig(
                     M=list(opt_m),
                     N=self.out_features,
@@ -68,7 +197,39 @@ class BitBLASW8A8Linear(nn.Module):
                     with_scaling=False,
                     with_bias=False,
                 )
+                self.kernel_stage = "matmul_build"
+                _LOGGER.info(
+                    "W8A8 kernel start: layer=%s stage=%s device=%s target=%s backend=tir "
+                    "enable_tuning=%s config=%s diagnostics=%s",
+                    self.name,
+                    self.kernel_stage,
+                    self.qweight.device,
+                    target,
+                    enable_tuning,
+                    config,
+                    diagnostics,
+                )
                 operator = Matmul(config, target=target, backend="tir", enable_tuning=enable_tuning)
+                self.kernel_stage = "runtime_validation"
+                runtime_ready = getattr(operator, "rt_mod", None) is not None
+                torch_ready = callable(getattr(operator, "torch_func", None))
+                _LOGGER.info(
+                    "W8A8 runtime state: layer=%s rt_mod=%s torch_func=%s lib=%s scheduled_ir_module=%s",
+                    self.name,
+                    runtime_ready,
+                    torch_ready,
+                    getattr(operator, "lib", None) is not None,
+                    getattr(operator, "scheduled_ir_module", None) is not None,
+                )
+                if not runtime_ready or not torch_ready:
+                    raise RuntimeError(
+                        "BitBLAS returned an incomplete TIR runtime "
+                        f"(rt_mod={runtime_ready}, torch_func={torch_ready}); "
+                        "scheduling/build may have failed internally. "
+                        "Rerun with OPENPI_BITBLAS_DIAGNOSTICS=1 and inspect the first "
+                        "'BitBLAS internal exception' in benchmark.log."
+                    )
+                self.kernel_stage = "weight_packing"
                 packed = operator.transform_weight(self.qweight.contiguous())
                 if isinstance(packed, list | tuple):
                     if len(packed) != 1:
@@ -76,12 +237,16 @@ class BitBLASW8A8Linear(nn.Module):
                     packed = packed[0]
                 if not isinstance(packed, torch.Tensor) or packed.device != self.qweight.device:
                     raise RuntimeError("BitBLAS returned an invalid packed weight")
+                self.kernel_stage = "int8_probe"
+                _LOGGER.info("W8A8 weight packing passed: layer=%s; starting INT8 probe", self.name)
                 # Check all output channels, with signed nonconstant activations.
                 probe = (torch.arange(self.in_features, device=self.qweight.device) % 7 - 3).to(torch.int8)
                 probe = probe.expand(opt_m[0], -1).contiguous()
                 output = torch.empty((opt_m[0], self.out_features), dtype=torch.int32, device=probe.device)
                 operator(probe, packed, output=output)
+                self.kernel_stage = "probe_synchronize"
                 torch.cuda.synchronize(self.qweight.device)
+                self.kernel_stage = "integer_reference"
                 reference = (self.qweight.cpu().to(torch.int64) * probe[0].cpu().to(torch.int64)).sum(dim=1)
                 if not torch.equal(output.cpu().to(torch.int64), reference.expand(opt_m[0], -1)):
                     raise RuntimeError("INT8 kernel probe disagrees with integer reference")
@@ -90,8 +255,29 @@ class BitBLASW8A8Linear(nn.Module):
                 self.kernel_verified = True
                 self.kernel_target = str(target)
                 self.probe_m = opt_m[0]
+                self.kernel_stage = "verified"
         except Exception as exc:
-            raise RuntimeError(f"{self.name}: BitBLAS INT8 initialization/packing/probe failed") from exc
+            first_error = capture.first_error if capture is not None else None
+            self.kernel_error = f"{type(exc).__name__}: {exc}"
+            _LOGGER.exception(
+                "W8A8 kernel failed: layer=%s stage=%s device=%s M=%s N=%d K=%d target=%s "
+                "backend=tir enable_tuning=%s config=%s first_internal_error=%s",
+                self.name,
+                self.kernel_stage,
+                self.qweight.device,
+                opt_m,
+                self.out_features,
+                self.in_features,
+                target,
+                enable_tuning,
+                config,
+                first_error,
+            )
+            detail = f"; first_internal_error={first_error}" if first_error else ""
+            raise RuntimeError(
+                f"{self.name}: BitBLAS INT8 initialization/packing/probe failed "
+                f"at stage={self.kernel_stage}: {self.kernel_error}{detail}"
+            ) from exc
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if not self.kernel_verified or self.bitblas_matmul is None or self._packed_weight is None:
@@ -144,6 +330,8 @@ def w8a8_diagnostics(model: nn.Module) -> dict:
             "forward_calls": layer.forward_calls,
             "target": layer.kernel_target,
             "probe_m": layer.probe_m,
+            "initialization_stage": layer.kernel_stage,
+            "initialization_error": layer.kernel_error,
             "activation_dtype": "int8",
             "accum_dtype": "int32",
             "last_activation_dtype": layer.last_activation_dtype,

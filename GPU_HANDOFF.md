@@ -224,6 +224,73 @@ Python/로그 기록이 실패하면 셸은 첫 실패에서 중단하고 0이 �
 원인을 해결한 뒤 같은 명령으로 새 batch를 실행한다. 커널 캐시·GPU 온도·다른 프로세스는
 새 프로세스로 초기화되지 않으므로 실험 당시 GPU 상태도 함께 기록한다.
 
+### 4.1 BitBLAS 0.1.0.post1 커널 준비 오류 진단
+
+2026-11-02 GPU 서버에서 보고된 환경은 RTX A6000, NVIDIA Driver 570.172.08,
+CUDA Toolkit 12.1, BitBLAS 0.1.0.post1이다. 180개 레이어의 strict checkpoint load는
+성공했지만 커널 준비에서 `AttributeError: 'Matmul' object has no attribute 'torch_func'`가 발생했다.
+이 환경의 실제 최초 빌드 오류는 아래 진단 실행 로그로 확인해야 한다.
+
+호출 경로는 `run_w8a8_gpu.sh` → benchmark coordinator → 별도 worker → `timed_initialize` →
+`load_w8a8_policy` → strict checkpoint load → 레이어별 `initialize_kernel` →
+`Matmul(..., backend="tir")` → `transform_weight` → INT8 probe다.
+
+[BitBLAS 0.1.0.post1 배포 파일](https://pypi.org/project/bitblas/0.1.0.post1/#files)의
+`bitblas/ops/operator.py`를 확인한 결과, `_build_default_module`은 스케줄링 예외를
+traceback 없는 WARNING으로 처리하고, `_build_runtime_module`은 `tvm.build` 예외를 잘린 DEBUG
+메시지로 처리한다. 빌드가 실패하면 `rt_mod=None`이 남고 `torch_func`가 생성되지 않을 수 있다.
+따라서 `torch_func` 오류는 최초 스케줄링/빌드 실패의 후속 증상일 가능성이 있으며,
+이 메시지만으로 GPU·CUDA 호환성이나 체크포인트 문제를 확정할 수 없다.
+확인에 사용한 Linux wheel의 SHA256은
+`5beaf38899671dc35da63ff31b8d7bea4d98a2c929a102fe40d2f3004cec391b`다.
+
+기존 서버 환경과 체크포인트를 그대로 사용해 저장소 루트에서 실행한다. 아래 두 경로는
+현재 사용 중인 실제 경로로 지정한다. `ENABLE_TUNING`은 실패 당시 설정을 유지한다
+(기존 기본값은 `0`; 당시 튜닝을 켰다면 `1`).
+
+```bash
+OPENPI_BITBLAS_DIAGNOSTICS=1 \
+PYTHON_BIN=/path/to/existing/venv/bin/python \
+W8A8_CHECKPOINT=/path/to/existing/pi05-libero-w8a8 \
+FP_CHECKPOINT='' \
+RUNS=1 ENABLE_TUNING=0 \
+OUTPUT_ROOT=data/w8a8-kernel-diagnostics \
+bash scripts/run_w8a8_gpu.sh
+```
+
+`OPENPI_BITBLAS_DIAGNOSTICS=1`은 worker에도 상속된다. 기존 캐시를 삭제하거나 의존성을
+재설치하지 않는다. 진단 모드는 초기화 범위에서만 BitBLAS의 스케줄링·빌드 관련 logger를
+DEBUG로 열고, 내부 `except` 안에서 기록되는 예외의 전체 traceback을 OpenPI ERROR 로그로
+전달한다. 일반 DEBUG 메시지도 INFO로 전달하므로 로그에 생성 소스 등 상세 정보가 포함될 수 있다.
+초기화가 끝나거나 실패하면 기존 logger 설정을 복원한다. Matmul/TVM 함수는 교체하지 않는다.
+
+확인할 파일은 새 batch의 `run_01/reports/benchmark.log`다.
+
+```bash
+# 실행 출력에 표시된 실제 batch 경로로 바꾼다.
+LOG=data/w8a8-kernel-diagnostics/batch-<timestamp>-<suffix>/run_01/reports/benchmark.log
+grep -nE 'diagnostic environment|W8A8 kernel start|BitBLAS internal exception|W8A8 runtime state|W8A8 kernel failed' "$LOG"
+less "$LOG"
+```
+
+- 최초 `BitBLAS internal exception #1`과 바로 뒤의 전체 traceback을 우선 확인한다.
+  `source=bitblas.ops.operator:...` 등 원래 logger/줄 번호도 남는다. 내부에서 복구되는
+  스케줄 후보 오류도 기록될 수 있으므로 마지막 `W8A8 kernel failed`와 함께 해석한다.
+- `W8A8 kernel start`는 레이어 이름, target, backend, tuning, MatmulConfig를 기록한다.
+  실패 로그는 M/N/K와 `matmul_build`, `runtime_validation`, `weight_packing`, `int8_probe`,
+  `probe_synchronize`, `integer_reference` 등의 세부 단계를 기록한다.
+- 환경 로그에서 실제 import된 BitBLAS/TVM 경로·버전, PyTorch 버전과 `torch.version.cuda`,
+  GPU와 compute capability를 확인한다. `torch.version.cuda`와 서버 CUDA Toolkit 버전은 별개다.
+- 불완전한 `rt_mod`/`torch_func`는 packing 전에 실패시킨다. `summary.json`에는
+  `models.w8a8.failure_stage=kernel_preparation`과 `kernel_failure`의 레이어·단계·설정·오류가 남는다.
+  실패 후 CUDA synchronize가 추가 오류를 내도 최초 예외를 유지한다.
+- 별도 빌드 프로세스가 이미 잘라서 반환한 오류 문자열이나 로그 없이 버린 스케줄 후보의
+  traceback까지 복원할 수는 없다. 최종 traceback과 직전 DEBUG/빌드 메시지도 함께 전달한다.
+
+서버 재실행 결과로 `reports/benchmark.log`, `reports/summary.json`, `command.txt`,
+`exit_code.txt`를 전달한다. 양자화 수식, INT8 raw qweight, FP32 scale, 기존 checkpoint,
+M 기본값, TIR backend와 tuning 설정은 유지한다. 진단이 끝나면 환경 변수만 생략해 평소대로 실행한다.
+
 ## 5. 전달 파일 유지 범위
 
 | 파일 | 구분 | 역할 / 유지 판단 |
@@ -232,11 +299,12 @@ Python/로그 기록이 실패하면 셸은 첫 실패에서 중단하고 0이 �
 | `scripts/benchmark_pi05_fp_w8a8.py` | 실행 필수 | CLI, 새 CUDA worker, 측정 및 JSON/CSV/로그 생성 |
 | `src/openpi/policies/w8a8_policy.py` | 실행 필수 | manifest·정규화·체크포인트 strict 검증과 policy 로딩 |
 | `src/openpi/models_pytorch/bitblas_w8a8_layers.py` | 실행 필수 | INT8 가중치/활성화, BitBLAS INT32 연산, 정수 probe 및 진단 |
+| `quantization/w8a8/test_kernel_diagnostics.py` | 개발 검증 | 내부 예외 traceback, logger 복원, 불완전 런타임과 체크포인트 보존의 CPU 모의 검사 |
 | `quantization/w8a8/NOTICE.md` | 출처 문서 | 외부 출처·변경·체크포인트·미검증 사항 기록; 유지 |
 | `quantization/w8a8/LICENSE.openpi_duquant` | 외부 라이선스 | Apache-2.0 원문; 유지 필수 |
 
-GPU 전달본에서는 실행 중 호출하지 않는 CPU 회귀 테스트 파일을 제외했다.
-테스트 원본과 기존 검증 기록은 아래 고정 commit 링크에서 확인할 수 있다.
+GPU 전달본에서는 기존 CPU 회귀 테스트 파일을 제외했다. 이번 커널 진단용 테스트는 별도로 추가했으며,
+벤치마크 실행 중 호출하지 않는다. 기존 테스트 원본과 검증 기록은 아래 고정 commit 링크에서 확인할 수 있다.
 `.gitattributes`는 셸의 LF 줄바꿈을 유지하므로 보존한다.
 기존 [측정 상세 문서](examples/libero/README.md)는 직접 Python CLI 사용법과 결과 해석의 참고 자료로 유지한다.
 위 실행 필수 4개만 복사하면 되는 것은 아니다. 전체 OpenPI 소스·의존성·공식 Transformers 교체 파일과
@@ -245,6 +313,17 @@ GPU 전달본에서는 실행 중 호출하지 않는 CPU 회귀 테스트 파�
 `scripts/serve_policy.py`는 이 벤치마크가 호출하지 않지만 기존 서버와 Docker 진입점이므로 유지한다.
 
 ## 6. 기존 로컬 검증 기록과 GPU 검증 범위
+
+이번 커널 진단 변경은 Windows Python 3.12.2 / PyTorch 2.7.1+cpu 환경에서
+`quantization/w8a8/test_kernel_diagnostics.py`의 CPU 모의 검사 9개를 통과했다.
+잘린 DEBUG/WARNING의 원본 예외·전체 traceback, 최초 예외 순서, logger 복원,
+잘못된 upstream 로그 포맷 처리, 불완전 런타임의 packing 중단과 checkpoint 텐서 보존을 검사했다.
+변경한 Python 파일의 Ruff lint/format 검사와 benchmark `--help`도 통과했다.
+이는 GPU 커널 생성 성공이나 실제 서버의 최초 실패 원인을 검증한 결과가 아니다.
+
+```bash
+PYTHONPATH=src .venv/bin/python -m pytest quantization/w8a8/test_kernel_diagnostics.py -q
+```
 
 기존 commit `b9965ddea250f1191b9411a2a5d12c6896e911de`에 기록된 Windows CPU 회귀 검사에서는
 21개가 통과했다. [당시 테스트 원본](https://github.com/2chae1-1/openpi0.5/blob/b9965ddea250f1191b9411a2a5d12c6896e911de/quantization/w8a8/test_benchmark.py)은

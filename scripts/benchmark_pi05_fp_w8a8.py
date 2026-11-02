@@ -576,15 +576,33 @@ def _worker(args):
                 original_initialize = BitBLASW8A8Linear.initialize_kernel
 
                 def timed_initialize(module, *positional, **keywords):
-                    torch.cuda.synchronize(device)
+                    save("kernel_preparation")
                     started = time.perf_counter()
                     try:
-                        return original_initialize(module, *positional, **keywords)
+                        torch.cuda.synchronize(device)
+                        started = time.perf_counter()
+                        value = original_initialize(module, *positional, **keywords)
+                        torch.cuda.synchronize(device)
+                        return value
                     except Exception:
-                        result["stage"] = "kernel_preparation"
+                        result["kernel_failure"] = {
+                            "layer": module.name,
+                            "stage": getattr(module, "kernel_stage", None),
+                            "error": getattr(module, "kernel_error", None),
+                            "in_features": module.in_features,
+                            "out_features": module.out_features,
+                            "opt_m": list(args.opt_m),
+                            "enable_tuning": args.enable_tuning,
+                        }
+                        try:
+                            torch.cuda.synchronize(device)
+                        except Exception:
+                            logging.exception(
+                                "Secondary CUDA synchronize failure for %s; preserving initialization exception",
+                                module.name,
+                            )
                         raise
                     finally:
-                        torch.cuda.synchronize(device)
                         kernel_seconds.append(time.perf_counter() - started)
 
                 with mock.patch.object(BitBLASW8A8Linear, "initialize_kernel", timed_initialize):
