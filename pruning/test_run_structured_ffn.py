@@ -219,6 +219,8 @@ class TestMockedCheckpointPipeline(unittest.TestCase):
         self.assertEqual(restored_model.calls, 1)
         baseline_input, compact_input = model.inference_inputs
         restored_input = restored_model.inference_inputs[0]
+        for camera, image in baseline_input[0].images.items():
+            self.assertEqual(image.shape, (1, 3, 224, 224), camera)
         self.assertIs(baseline_input[0], compact_input[0])
         self.assertIs(compact_input[0], restored_input[0])
         self.assertTrue(torch.equal(baseline_input[1], compact_input[1]))

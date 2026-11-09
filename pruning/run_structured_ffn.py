@@ -169,7 +169,7 @@ def make_smoke_inputs(config, device: torch.device, batch_size: int, seed: int):
     token_mask = torch.zeros_like(tokens, dtype=torch.bool)
     token_mask[:, 0] = True
     observation = SimpleNamespace(
-        images={key: torch.zeros(batch_size, 224, 224, 3, device=device) for key in image_keys},
+        images={key: torch.zeros(batch_size, 3, 224, 224, device=device) for key in image_keys},
         image_masks={key: torch.full((batch_size,), key != "right_wrist_0_rgb", device=device) for key in image_keys},
         state=torch.zeros(batch_size, config.action_dim, device=device),
         tokenized_prompt=tokens,
