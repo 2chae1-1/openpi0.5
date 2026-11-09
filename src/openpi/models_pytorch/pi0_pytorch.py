@@ -417,7 +417,7 @@ class PI0Pytorch(nn.Module):
         return F.mse_loss(u_t, v_t, reduction="none")
 
     @torch.no_grad()
-    def sample_actions(self, device, observation, noise=None, num_steps=10) -> Tensor:
+    def sample_actions(self, device, observation, noise=None, num_steps=10, *, skip_masked_views=False) -> Tensor:
         """Do a full inference forward and compute the action (batch_size x num_steps x num_motors)"""
         bsize = observation.state.shape[0]
         if noise is None:
@@ -428,8 +428,15 @@ class PI0Pytorch(nn.Module):
             observation, train=False, tag_camera_keys=False
         )
 
+        image_keys = _preprocessing.IMAGE_KEYS
+        if skip_masked_views:
+            # A camera slot is removable only if it is masked for the entire batch.
+            kept = [i for i, mask in enumerate(img_masks) if mask.any()]
+            images = [images[i] for i in kept]
+            img_masks = [img_masks[i] for i in kept]
+            image_keys = tuple(image_keys[i] for i in kept)
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
-            images, img_masks, lang_tokens, lang_masks, image_keys=_preprocessing.IMAGE_KEYS
+            images, img_masks, lang_tokens, lang_masks, image_keys=image_keys
         )
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1

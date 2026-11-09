@@ -23,6 +23,7 @@ import torch
 
 from pruning.lm_head_audit import lm_head_metrics
 from pruning.lm_head_audit import observe_lm_head_calls
+from pruning.structured_ffn import _get_layers
 from pruning.structured_ffn import estimate_pi05_ffn_reduction
 from pruning.structured_ffn import prepare_pi05_pruned_shapes
 from pruning.structured_ffn import prune_pi05_ffns
@@ -123,7 +124,7 @@ def load_original_bf16(checkpoint_dir: str):
     return model, config, resolved
 
 
-def parameter_metrics(model: torch.nn.Module) -> dict:
+def parameter_metrics(model: torch.nn.Module, *, include_vision: bool = False) -> dict:
     """Count unique parameters and their actual dtype-dependent tensor storage."""
     def count(parameters):
         result = {"parameters": 0, "weight_bytes": 0, "by_dtype": {}}
@@ -145,7 +146,7 @@ def parameter_metrics(model: torch.nn.Module) -> dict:
     root = model.paligemma_with_expert
     expert_layers = root.gemma_expert.model.layers
     language_layers = root.paligemma.language_model.layers
-    return {
+    metrics = {
         "model": count(model.parameters()),
         "action_expert_ffn": count(p for layer in expert_layers for p in layer.mlp.parameters()),
         "language_ffn": count(p for layer in language_layers for p in layer.mlp.parameters()),
@@ -153,6 +154,11 @@ def parameter_metrics(model: torch.nn.Module) -> dict:
         "expert_intermediate_sizes": [layer.mlp.gate_proj.out_features for layer in expert_layers],
         "language_intermediate_sizes": [layer.mlp.gate_proj.out_features for layer in language_layers],
     }
+    if include_vision:
+        vision_layers = _get_layers(model, "vision")
+        metrics["vision_ffn"] = count(p for layer in vision_layers for p in layer.mlp.parameters())
+        metrics["vision_intermediate_sizes"] = [layer.mlp.fc1.out_features for layer in vision_layers]
+    return metrics
 
 
 def make_smoke_inputs(config, device: torch.device, batch_size: int, seed: int):
@@ -178,11 +184,24 @@ def make_smoke_inputs(config, device: torch.device, batch_size: int, seed: int):
 
 @torch.inference_mode()
 def measure_output(
-    model, device: torch.device, observation, noise: torch.Tensor, num_steps: int,
+    model, device: torch.device, observation, noise: torch.Tensor, num_steps: int, *, vision: bool = False,
 ) -> tuple[dict, torch.Tensor]:
     """Validate actions and keep the tensor for the saved-model comparison."""
+    image_shapes = []
     with observe_lm_head_calls(model) as lm_head_usage:
-        output = model.sample_actions(device, observation, noise=noise.clone(), num_steps=num_steps)
+        if vision:
+            if model.vision_token_pooling != "none":
+                raise ValueError("The vision FFN comparison requires OPENPI_VISION_TOKEN_POOLING=none.")
+            projector = model.paligemma_with_expert.paligemma.model.multi_modal_projector
+            handle = projector.register_forward_hook(lambda _module, _args, output: image_shapes.append(list(output.shape)))
+            try:
+                output = model.sample_actions(
+                    device, observation, noise=noise.clone(), num_steps=num_steps, skip_masked_views=True
+                )
+            finally:
+                handle.remove()
+        else:
+            output = model.sample_actions(device, observation, noise=noise.clone(), num_steps=num_steps)
     if not isinstance(output, torch.Tensor):
         raise TypeError("sample_actions did not return a tensor.")
     result = {
@@ -193,6 +212,11 @@ def measure_output(
     if not bool(torch.isfinite(output).all()):
         raise ValueError("sample_actions produced non-finite values.")
     result["all_finite"] = True
+    if vision:
+        expected = [noise.shape[0], 256, 2048]
+        if image_shapes != [expected, expected] or observation.tokenized_prompt.shape[1] != 200:
+            raise ValueError(f"Expected two projected views of shape {expected} and 200 prompt tokens; got {image_shapes}.")
+        result.update(projected_image_shapes=image_shapes, prefix_tokens=712)
     return result, output.detach().clone()
 
 
@@ -243,6 +267,9 @@ def load_pruned_model(artifact_dir: str | Path, device: str = "cpu"):
 
 
 def run(args: argparse.Namespace) -> tuple[dict, int]:
+    vision = args.target == "vision"
+    if vision and (args.device != "cpu" or "://" in args.checkpoint_dir):
+        raise ValueError("Vision FFN preparation requires --device cpu and a local dense checkpoint.")
     output_dir = Path(args.output_dir).expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     # Do not leave an old successful report/weights associated with a failed rerun.
@@ -284,7 +311,7 @@ def run(args: argparse.Namespace) -> tuple[dict, int]:
         },
         "memory_definition": "Unique parameter numel * element_size; excludes buffers, activations, KV cache and allocator overhead.",
         "notes": ["Training-free weight-magnitude heuristic; no calibration, gradients or fine-tuning.",
-                  "Magnitude pruning is the baseline; only selected expert/language gated FFN intermediate channels are removed.",
+                  "Magnitude pruning removes only the selected FFN intermediate channels.",
                   "All lm_head modules are retained; Action Expert head usage observations apply only to each sampled forward.",
                   "Output shapes are raw model actions, before LIBERO policy postprocessing."],
     }
@@ -299,14 +326,19 @@ def run(args: argparse.Namespace) -> tuple[dict, int]:
         model, config, resolved = load_original_bf16(args.checkpoint_dir)
         report["resolved_checkpoint_dir"] = str(resolved)
         report["verification"]["original_checkpoint_loaded"] = True
-        report["before"] = parameter_metrics(model)
-        report["ten_percent_projection"] = {
-            "basis": "shape_based_projection_not_compression_measurement",
-            "requested_prune_fraction": 0.10,
-            "multiple_of": args.multiple_of,
-            "model_parameters_before": report["before"]["model"]["parameters"],
-            **estimate_pi05_ffn_reduction(model, keep_fraction=0.9, multiple_of=args.multiple_of),
-        }
+        report["before"] = parameter_metrics(model, include_vision=vision)
+        if vision:
+            report["outputs"].update(skip_masked_views=True, vision_token_pooling="none")
+            if model.vision_token_pooling != "none":
+                raise ValueError("The vision FFN comparison requires OPENPI_VISION_TOKEN_POOLING=none.")
+        else:
+            report["ten_percent_projection"] = {
+                "basis": "shape_based_projection_not_compression_measurement",
+                "requested_prune_fraction": 0.10,
+                "multiple_of": args.multiple_of,
+                "model_parameters_before": report["before"]["model"]["parameters"],
+                **estimate_pi05_ffn_reduction(model, keep_fraction=0.9, multiple_of=args.multiple_of),
+            }
         device = torch.device(args.device)
         inputs = None
         if not args.skip_forward:
@@ -314,7 +346,7 @@ def run(args: argparse.Namespace) -> tuple[dict, int]:
             try:
                 model.to(device)
                 inputs = make_smoke_inputs(config.model, device, args.batch_size, args.seed)
-                report["outputs"]["before"], _ = measure_output(model, device, *inputs, args.num_steps)
+                report["outputs"]["before"], _ = measure_output(model, device, *inputs, args.num_steps, vision=vision)
             except Exception as exc:
                 report["outputs"]["before"] = {"status": "failed", "shape": None, "error": f"{type(exc).__name__}: {exc}"}
                 inputs = None
@@ -325,13 +357,13 @@ def run(args: argparse.Namespace) -> tuple[dict, int]:
         stage = "physical_pruning"
         manifest = prune_pi05_ffns(model, target=args.target, keep_fraction=1 - args.prune_fraction, multiple_of=args.multiple_of)
         report["verification"]["physical_pruning"] = True
-        report["after"] = parameter_metrics(model)
+        report["after"] = parameter_metrics(model, include_vision=vision)
         report["parameters_removed"] = manifest["parameters_removed"]
         report["model_parameter_reduction_pct"] = manifest["model_parameter_reduction_pct"]
         report["weight_bytes_removed"] = report["before"]["model"]["weight_bytes"] - report["after"]["model"]["weight_bytes"]
         report["per_target"] = manifest["per_target"]
         for part, metrics in report["per_target"].items():
-            metric_key = "action_expert_ffn" if part == "expert" else "language_ffn"
+            metric_key = "action_expert_ffn" if part == "expert" else f"{part}_ffn"
             metrics["weight_bytes_removed"] = (
                 report["before"][metric_key]["weight_bytes"] - report["after"][metric_key]["weight_bytes"]
             )
@@ -344,7 +376,9 @@ def run(args: argparse.Namespace) -> tuple[dict, int]:
         report["artifacts"] = save_pruned_artifacts(model, config, manifest, output_dir, save_state_dict=not args.no_save_state_dict)
         if inputs is not None:
             stage = "pruned_forward"
-            report["outputs"]["after"], pruned_actions = measure_output(model, device, *inputs, args.num_steps)
+            report["outputs"]["after"], pruned_actions = measure_output(
+                model, device, *inputs, args.num_steps, vision=vision,
+            )
             report["verification"]["output_shapes_match"] = report["outputs"]["before"]["shape"] == report["outputs"]["after"]["shape"]
             if not args.no_save_state_dict:
                 # Release the compact model before constructing another full model,
@@ -359,7 +393,7 @@ def run(args: argparse.Namespace) -> tuple[dict, int]:
                 restored_model = load_pruned_model(output_dir, device=str(device))
                 stage = "restored_forward"
                 report["outputs"]["restored"], restored_actions = measure_output(
-                    restored_model, device, *inputs, args.num_steps,
+                    restored_model, device, *inputs, args.num_steps, vision=vision,
                 )
                 stage = "restore_compare"
                 roundtrip.update({
@@ -406,8 +440,8 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--checkpoint-dir", required=True, help="Local or remote directory containing original dense model.safetensors.")
     parser.add_argument("--output-dir", required=True, help="New directory for report, manifest and compact state_dict.")
     parser.add_argument("--device", default="cuda", help="cuda, cuda:N or cpu; BF16 weights are retained on CPU.")
-    parser.add_argument("--target", choices=("expert", "language", "both"), default="expert",
-                        help="FFNs to prune: Action Expert (default), Language Backbone, or both.")
+    parser.add_argument("--target", choices=("expert", "language", "both", "vision"), default="expert",
+                        help="FFNs to prune: Action Expert (default), Language Backbone, both Gemma stacks, or SigLIP.")
     parser.add_argument("--prune-fraction", type=float, default=0.10)
     parser.add_argument("--multiple-of", type=int, default=1, help="Retained FFN width alignment; actual ratio is reported.")
     parser.add_argument("--batch-size", type=int, default=1)
@@ -421,6 +455,8 @@ def parse_args(argv=None) -> argparse.Namespace:
         parser.error("--prune-fraction must be in (0, 1).")
     if min(args.multiple_of, args.batch_size, args.num_steps) < 1:
         parser.error("--multiple-of, --batch-size and --num-steps must be positive.")
+    if args.target == "vision" and (args.device != "cpu" or "://" in args.checkpoint_dir):
+        parser.error("--target vision requires --device cpu and a local dense checkpoint.")
     return args
 
 

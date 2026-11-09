@@ -82,8 +82,8 @@ def _run_split_style_inference(model, observation, noise):
 
 
 @pytest.mark.parametrize(("mode", "image_tokens"), [("none", 512), ("avg", 384), ("max", 384)])
-@pytest.mark.parametrize("filter_empty", [True, False], ids=["split-style", "sample-actions"])
-def test_libero_prefix_cache_and_denoising_positions(mode, image_tokens, filter_empty):
+@pytest.mark.parametrize("path", ["split-style", "sample-actions", "sample-actions-skip-empty"])
+def test_libero_prefix_cache_and_denoising_positions(mode, image_tokens, path):
     model = pi0_pytorch.PI0Pytorch.__new__(pi0_pytorch.PI0Pytorch)
     nn.Module.__init__(model)
     model.config = Pi0Config(pi05=True, action_dim=2, action_horizon=3, pytorch_compile_mode=None)
@@ -118,14 +118,17 @@ def test_libero_prefix_cache_and_denoising_positions(mode, image_tokens, filter_
         token_loss_mask=None,
     )
     noise = torch.zeros(2, 3, 2)
-    if filter_empty:
+    if path == "split-style":
         actions = _run_split_style_inference(model, observation, noise)
     else:
-        actions = model.sample_actions(torch.device("cpu"), observation, noise=noise, num_steps=2)
+        actions = model.sample_actions(
+            torch.device("cpu"), observation, noise=noise, num_steps=2,
+            skip_masked_views=path == "sample-actions-skip-empty",
+        )
     assert actions.shape == (2, 3, 2)
     assert torch.isfinite(actions).all()
 
-    inactive_image_tokens = 0 if filter_empty else 256
+    inactive_image_tokens = 256 if path == "sample-actions" else 0
     prefix_len = image_tokens + inactive_image_tokens + 200
     prefix_pad = torch.cat(
         (

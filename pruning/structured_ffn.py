@@ -14,7 +14,7 @@ from typing import Literal
 import torch
 from torch import nn
 
-Target = Literal["expert", "language", "both"]
+Target = Literal["expert", "language", "both", "vision"]
 
 
 def _check_mlp(mlp: nn.Module) -> tuple[nn.Linear, nn.Linear, nn.Linear]:
@@ -92,7 +92,40 @@ def _get_layers(model: nn.Module, part: str):
         return root.gemma_expert.model.layers
     if part == "language":
         return root.paligemma.language_model.layers
+    if part == "vision":
+        return root.paligemma.vision_tower.vision_model.encoder.layers
     raise ValueError(part)
+
+
+def _siglip_projections(mlp: nn.Module) -> tuple[nn.Linear, nn.Linear]:
+    fc1, fc2 = mlp.fc1, mlp.fc2
+    if not all(isinstance(fc, nn.Linear) and fc.bias is not None for fc in (fc1, fc2)):
+        raise TypeError("Expected dense SigLIP fc1/fc2 with biases.")
+    if fc1.out_features != fc2.in_features or fc1.in_features != fc2.out_features:
+        raise ValueError("Incompatible SigLIP FFN dimensions.")
+    return fc1, fc2
+
+
+@torch.no_grad()
+def prune_siglip_mlp(mlp: nn.Module, keep_fraction: float, multiple_of: int) -> dict:
+    fc1, fc2 = _siglip_projections(mlp)
+    old_width = fc1.out_features
+    new_width = _aligned_kept(old_width, keep_fraction, multiple_of)
+    incoming = torch.linalg.vector_norm(fc1.weight.float(), dim=1)
+    incoming = torch.hypot(incoming, fc1.bias.float())
+    scores = incoming * torch.linalg.vector_norm(fc2.weight.float(), dim=0)
+    if not bool(torch.isfinite(scores).all()):
+        raise ValueError("Non-finite SigLIP magnitude score.")
+    kept = scores.argsort(descending=True, stable=True)[:new_width].sort().values
+    mlp.fc1 = _dense_linear_with_weights(fc1, fc1.weight.index_select(0, kept), fc1.bias.index_select(0, kept))
+    mlp.fc2 = _dense_linear_with_weights(fc2, fc2.weight.index_select(1, kept), fc2.bias.detach().clone())
+    return {
+        "original_intermediate": old_width,
+        "new_intermediate": new_width,
+        "removed_channels": old_width - new_width,
+        "kept_indices": kept.cpu().tolist(),
+        "score": "l2_fc1_with_bias_times_l2_fc2",
+    }
 
 
 def estimate_pi05_ffn_reduction(model: nn.Module, *, keep_fraction: float = 0.9, multiple_of: int = 1) -> dict:
@@ -138,17 +171,18 @@ def estimate_pi05_ffn_reduction(model: nn.Module, *, keep_fraction: float = 0.9,
 def prune_pi05_ffns(model: nn.Module, *, target: Target = "expert",
                     keep_fraction: float = 0.9, multiple_of: int = 64) -> dict:
     """Prune all layers in selected Pi0Pytorch component(s), *after* checkpoint load."""
-    if target not in ("expert", "language", "both"):
-        raise ValueError("target must be expert/language/both")
+    if target not in ("expert", "language", "both", "vision"):
+        raise ValueError("target must be expert/language/both/vision")
     parts = ["expert", "language"] if target == "both" else [target]
     before = sum(p.numel() for p in model.parameters())
     specs = []
     per_target = {}
     for part in parts:
         layers = _get_layers(model, part)
+        prune_mlp = prune_siglip_mlp if part == "vision" else prune_gemma_mlp
         ffn_before = sum(p.numel() for layer in layers for p in layer.mlp.parameters())
         for index, layer in enumerate(layers):
-            info = prune_gemma_mlp(layer.mlp, keep_fraction, multiple_of)
+            info = prune_mlp(layer.mlp, keep_fraction, multiple_of)
             specs.append({"part": part, "layer": index, **info})
         ffn_after = sum(p.numel() for layer in layers for p in layer.mlp.parameters())
         removed = ffn_before - ffn_after
@@ -170,23 +204,25 @@ def prune_pi05_ffns(model: nn.Module, *, target: Target = "expert",
             "layers": specs}
 
 
+def _empty_linear(src: nn.Linear, in_f: int, out_f: int) -> nn.Linear:
+    # Allocate real buffers; state_dict will replace their contents.
+    dst = nn.Linear(in_f, out_f, bias=src.bias is not None,
+                    device=src.weight.device, dtype=src.weight.dtype)
+    dst.weight.requires_grad_(src.weight.requires_grad)
+    if src.bias is not None:
+        dst.bias.requires_grad_(src.bias.requires_grad)
+    dst.train(src.training)
+    return dst
+
+
 def _resize_ffn(mlp: nn.Module, intermediate_size: int):
-    """Reshape FFN before load_state_dict(pruned_state) using *fresh* untrained buffers."""
+    """Reshape FFN before load_state_dict(pruned_state) using fresh buffers."""
     gate, up, down = _check_mlp(mlp)
     if intermediate_size <= 0:
         raise ValueError("intermediate_size must be positive")
-    def empty_linear(src: nn.Linear, in_f: int, out_f: int):
-        # Allocate real buffers; state_dict will replace their contents.
-        dst = nn.Linear(in_f, out_f, bias=src.bias is not None,
-                        device=src.weight.device, dtype=src.weight.dtype)
-        dst.weight.requires_grad_(src.weight.requires_grad)
-        if src.bias is not None:
-            dst.bias.requires_grad_(src.bias.requires_grad)
-        dst.train(src.training)
-        return dst
-    mlp.gate_proj = empty_linear(gate, gate.in_features, intermediate_size)
-    mlp.up_proj = empty_linear(up, up.in_features, intermediate_size)
-    mlp.down_proj = empty_linear(down, intermediate_size, down.out_features)
+    mlp.gate_proj = _empty_linear(gate, gate.in_features, intermediate_size)
+    mlp.up_proj = _empty_linear(up, up.in_features, intermediate_size)
+    mlp.down_proj = _empty_linear(down, intermediate_size, down.out_features)
     if hasattr(mlp, "intermediate_size"):
         mlp.intermediate_size = intermediate_size
 
@@ -200,4 +236,13 @@ def prepare_pi05_pruned_shapes(model: nn.Module, manifest: dict) -> None:
         raise ValueError("Unknown pruning manifest")
     for item in manifest["layers"]:
         layers = _get_layers(model, item["part"])
-        _resize_ffn(layers[item["layer"]].mlp, item["new_intermediate"])
+        mlp = layers[item["layer"]].mlp
+        width = item["new_intermediate"]
+        if item["part"] == "vision":
+            fc1, fc2 = _siglip_projections(mlp)
+            if not 0 < width <= fc1.out_features:
+                raise ValueError("Invalid compact SigLIP FFN width.")
+            mlp.fc1 = _empty_linear(fc1, fc1.in_features, width)
+            mlp.fc2 = _empty_linear(fc2, width, fc2.out_features)
+        else:
+            _resize_ffn(mlp, width)

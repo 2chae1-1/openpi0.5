@@ -198,7 +198,7 @@ class TestStructuredPruning(unittest.TestCase):
     def test_rejects_invalid_target_and_non_linear_language_ffn(self):
         model = TinyDualPi05()
         with self.assertRaises(ValueError):
-            prune_pi05_ffns(model, target="vision")
+            prune_pi05_ffns(model, target="unknown")
         model.paligemma_with_expert.paligemma.language_model.layers[0].mlp.gate_proj = nn.Identity()
         with self.assertRaises(TypeError):
             prune_pi05_ffns(model, target="language")

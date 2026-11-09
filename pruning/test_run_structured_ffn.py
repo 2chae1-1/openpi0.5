@@ -574,6 +574,10 @@ class TestMockedCheckpointPipeline(unittest.TestCase):
         for target in ("expert", "language", "both"):
             selected = runner.parse_args(["--checkpoint-dir", "unused", "--output-dir", "unused", "--target", target])
             self.assertEqual(selected.target, target)
+        vision = runner.parse_args([
+            "--checkpoint-dir", "unused", "--output-dir", "unused", "--target", "vision", "--device", "cpu",
+        ])
+        self.assertEqual(vision.target, "vision")
         for option, value in (("--prune-fraction", "0"), ("--prune-fraction", "1"), ("--multiple-of", "0"), ("--num-steps", "0"),
                               ("--target", "vision")):
             with self.subTest(option=option, value=value), mock.patch("sys.stderr"), self.assertRaises(SystemExit) as error:
