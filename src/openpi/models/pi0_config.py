@@ -35,6 +35,8 @@ class Pi0Config(_model.BaseModelConfig):
     pytorch_compile_mode: str | None = "max-autotune"
     # PyTorch pi05 only: pool horizontal neighbors in the base camera's token grid.
     vision_token_pooling: Literal["none", "avg", "max"] = "none"
+    # PyTorch pi05 inference only: remove trailing masked prompt slots at batch size one.
+    trim_language_padding: bool = False
 
     def __post_init__(self):
         if self.max_token_len is None:

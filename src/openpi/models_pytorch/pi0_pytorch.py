@@ -82,6 +82,14 @@ def make_att_2d_masks(pad_masks, att_masks):
     return att_2d_masks & pad_2d_masks
 
 
+@torch.compiler.disable
+def _trim_language_padding(tokens, mask):
+    # The slice bound depends on input data. Keep its extraction outside torch.compile.
+    positions = torch.arange(1, mask.shape[1] + 1, device=mask.device)
+    end = torch.where(mask[0], positions, 0).amax().item()
+    return tokens[:, :end], mask[:, :end]
+
+
 class PI0Pytorch(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -201,13 +209,14 @@ class PI0Pytorch(nn.Module):
         return time.to(dtype=torch.float32, device=device)
 
     def embed_prefix(
-        self, images, img_masks, lang_tokens, lang_masks, *, image_keys=None
+        self, images, img_masks, lang_tokens, lang_masks, *, image_keys=None, inference=False
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Embed images with SigLIP and language tokens with embedding layer to prepare
         for PaliGemma transformer processing.
 
         When pooling is enabled, pass the tensors returned by `_preprocess_observation`
         or supply the matching camera names in `image_keys`.
+        Inference callers can pass `inference=True` to honor `trim_language_padding`.
         """
         embs = []
         pad_masks = []
@@ -250,6 +259,15 @@ class PI0Pytorch(nn.Module):
             att_masks += [0] * num_img_embs
 
         # Process language tokens
+        if (
+            inference
+            and self.pi05
+            and self.config.trim_language_padding
+            and lang_masks.shape[0] == 1
+            and lang_masks.shape[1] > 0
+        ):
+            lang_tokens, lang_masks = _trim_language_padding(lang_tokens, lang_masks)
+
         def lang_embed_func(lang_tokens):
             lang_emb = self.paligemma_with_expert.embed_language_tokens(lang_tokens)
             lang_emb_dim = lang_emb.shape[-1]
@@ -436,7 +454,7 @@ class PI0Pytorch(nn.Module):
             img_masks = [img_masks[i] for i in kept]
             image_keys = tuple(image_keys[i] for i in kept)
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
-            images, img_masks, lang_tokens, lang_masks, image_keys=image_keys
+            images, img_masks, lang_tokens, lang_masks, image_keys=image_keys, inference=True
         )
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
