@@ -1,0 +1,153 @@
+from types import SimpleNamespace
+
+import pytest
+import torch
+from torch import nn
+from transformers import GemmaConfig
+from transformers.models.gemma.modeling_gemma import GemmaModel
+
+from openpi.models.pi0_config import Pi0Config
+from openpi.models_pytorch import pi0_pytorch
+from openpi.models_pytorch.gemma_pytorch import PaliGemmaWithExpertModel
+
+
+class _TinyGemmaBackbone(PaliGemmaWithExpertModel):
+    """Keep the production Gemma prefix/cache and expert paths with tiny CPU weights."""
+
+    width = 8
+
+    def __init__(self):
+        nn.Module.__init__(self)
+        self.paligemma = nn.Module()
+        self.paligemma.language_model = self._gemma(use_adarms=False)
+        self.gemma_expert = nn.Module()
+        self.gemma_expert.model = self._gemma(use_adarms=True)
+        self.prefix_call = None
+        self.denoise_calls = []
+
+    def _gemma(self, *, use_adarms):
+        return GemmaModel(
+            GemmaConfig(
+                vocab_size=32,
+                hidden_size=self.width,
+                intermediate_size=16,
+                num_hidden_layers=1,
+                num_attention_heads=2,
+                num_key_value_heads=1,
+                head_dim=4,
+                use_adarms=use_adarms,
+                adarms_cond_dim=self.width if use_adarms else None,
+                attn_implementation="eager",
+            )
+        )
+
+    def embed_image(self, image):
+        # Supply projected tokens without loading the production vision tower.
+        return image[:, 0, 0, :1].reshape(-1, 1, 1).expand(-1, 256, self.width)
+
+    def forward(self, *, attention_mask, position_ids, past_key_values, inputs_embeds, use_cache, adarms_cond=None):
+        if past_key_values is not None:
+            self.denoise_calls.append((attention_mask, position_ids, past_key_values, past_key_values.get_seq_length()))
+        outputs, cache = super().forward(
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            use_cache=use_cache,
+            adarms_cond=adarms_cond,
+        )
+        if use_cache:
+            self.prefix_call = (attention_mask, position_ids, cache)
+        return outputs, cache
+
+
+@torch.no_grad()
+def _run_split_style_inference(model, observation, noise):
+    images, masks, tokens, lang_masks, state = model._preprocess_observation(observation, train=False)  # noqa: SLF001
+    kept = [(image, mask) for image, mask in zip(images, masks, strict=True) if mask.any()]
+    images, masks = zip(*kept, strict=True)
+    assert len(images) == 2
+    embs, pad, att = model.embed_prefix(images, masks, tokens, lang_masks)
+    attention_mask = model._prepare_attention_masks_4d(pi0_pytorch.make_att_2d_masks(pad, att))  # noqa: SLF001
+    _, cache = model.paligemma_with_expert.forward(
+        attention_mask=attention_mask,
+        position_ids=pad.cumsum(dim=1) - 1,
+        past_key_values=None,
+        inputs_embeds=[embs, None],
+        use_cache=True,
+    )
+    for timestep in (torch.ones(2), torch.full((2,), 0.5)):
+        noise = noise - 0.5 * model.denoise_step(state, pad, cache, noise, timestep)
+    return noise
+
+
+@pytest.mark.parametrize(("mode", "image_tokens"), [("none", 512), ("avg", 384), ("max", 384)])
+@pytest.mark.parametrize("filter_empty", [True, False], ids=["split-style", "sample-actions"])
+def test_libero_prefix_cache_and_denoising_positions(mode, image_tokens, filter_empty):
+    model = pi0_pytorch.PI0Pytorch.__new__(pi0_pytorch.PI0Pytorch)
+    nn.Module.__init__(model)
+    model.config = Pi0Config(pi05=True, action_dim=2, action_horizon=3, pytorch_compile_mode=None)
+    model.pi05 = True
+    model.vision_token_pooling = mode
+    model.gradient_checkpointing_enabled = False
+    backbone = _TinyGemmaBackbone()
+    model.paligemma_with_expert = backbone
+    model.action_in_proj = nn.Linear(2, backbone.width)
+    model.action_out_proj = nn.Linear(backbone.width, 2)
+    model.time_mlp_in = nn.Linear(backbone.width, backbone.width)
+    model.time_mlp_out = nn.Linear(backbone.width, backbone.width)
+    model.eval()
+
+    valid_prompt_tokens = torch.tensor([17, 9])
+    prompt_mask = torch.arange(200)[None, :] < valid_prompt_tokens[:, None]
+    observation = SimpleNamespace(
+        images={
+            "base_0_rgb": torch.ones(2, 3, 224, 224),
+            "left_wrist_0_rgb": -torch.ones(2, 3, 224, 224),
+            "right_wrist_0_rgb": torch.zeros(2, 3, 224, 224),
+        },
+        image_masks={
+            "base_0_rgb": torch.tensor([True, True]),
+            "left_wrist_0_rgb": torch.tensor([True, True]),
+            "right_wrist_0_rgb": torch.tensor([False, False]),
+        },
+        state=torch.zeros(2, 2),
+        tokenized_prompt=torch.ones(2, 200, dtype=torch.long),
+        tokenized_prompt_mask=prompt_mask,
+        token_ar_mask=None,
+        token_loss_mask=None,
+    )
+    noise = torch.zeros(2, 3, 2)
+    if filter_empty:
+        actions = _run_split_style_inference(model, observation, noise)
+    else:
+        actions = model.sample_actions(torch.device("cpu"), observation, noise=noise, num_steps=2)
+    assert actions.shape == (2, 3, 2)
+    assert torch.isfinite(actions).all()
+
+    inactive_image_tokens = 0 if filter_empty else 256
+    prefix_len = image_tokens + inactive_image_tokens + 200
+    prefix_pad = torch.cat(
+        (
+            torch.ones(2, image_tokens, dtype=torch.bool),
+            torch.zeros(2, inactive_image_tokens, dtype=torch.bool),
+            prompt_mask,
+        ),
+        dim=1,
+    )
+    prefix_mask, prefix_positions, cache = backbone.prefix_call
+    assert prefix_mask.shape == (2, 1, prefix_len, prefix_len)
+    torch.testing.assert_close(prefix_mask[:, 0] == 0, prefix_pad[:, :, None] & prefix_pad[:, None, :])
+    torch.testing.assert_close(prefix_positions, prefix_pad.cumsum(dim=1) - 1)
+    assert cache.get_seq_length() == prefix_len
+    assert cache[0][0].shape == cache[0][1].shape == (2, 1, prefix_len, 4)
+
+    assert len(backbone.denoise_calls) == 2
+    expected_positions = image_tokens + valid_prompt_tokens[:, None] + torch.arange(3)
+    expected_suffix_mask = torch.cat((prefix_pad, torch.ones(2, 3, dtype=torch.bool)), dim=1)
+    for mask, positions, incoming_cache, cache_length in backbone.denoise_calls:
+        assert incoming_cache is cache
+        assert cache_length == prefix_len
+        assert mask.shape == (2, 1, 3, prefix_len + 3)
+        torch.testing.assert_close(mask[:, 0] == 0, expected_suffix_mask[:, None, :].expand(-1, 3, -1))
+        torch.testing.assert_close(positions, expected_positions)

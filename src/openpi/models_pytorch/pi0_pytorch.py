@@ -1,5 +1,6 @@
 import logging
 import math
+import os
 
 import torch
 from torch import Tensor
@@ -86,6 +87,11 @@ class PI0Pytorch(nn.Module):
         super().__init__()
         self.config = config
         self.pi05 = config.pi05
+        self.vision_token_pooling = os.environ.get("OPENPI_VISION_TOKEN_POOLING", config.vision_token_pooling)
+        if self.vision_token_pooling not in ("none", "avg", "max"):
+            raise ValueError(f"Vision token pooling must be none, avg, or max, got {self.vision_token_pooling!r}")
+        if self.vision_token_pooling != "none" and not self.pi05:
+            raise ValueError("Vision token pooling requires PyTorch pi05")
 
         paligemma_config = _gemma.get_config(config.paligemma_variant)
         action_expert_config = _gemma.get_config(config.action_expert_variant)
@@ -159,11 +165,21 @@ class PI0Pytorch(nn.Module):
         att_2d_masks_4d = att_2d_masks[:, None, :, :]
         return torch.where(att_2d_masks_4d, 0.0, -2.3819763e38)
 
-    def _preprocess_observation(self, observation, *, train=True):
+    def _preprocess_observation(self, observation, *, train=True, tag_camera_keys=True):
         """Helper method to preprocess observation."""
         observation = _preprocessing.preprocess_observation_pytorch(observation, train=train)
+        if self.vision_token_pooling == "none" or not tag_camera_keys:
+            images = list(observation.images.values())
+        else:
+            images = []
+            for key, image in observation.images.items():
+                # The split caller filters these tensors into a new list. Use a view
+                # so each entry carries its own key even if the inputs share a tensor.
+                camera_image = image.view_as(image)
+                camera_image._openpi_camera_key = key  # noqa: SLF001
+                images.append(camera_image)
         return (
-            list(observation.images.values()),
+            images,
             list(observation.image_masks.values()),
             observation.tokenized_prompt,
             observation.tokenized_prompt_mask,
@@ -185,22 +201,45 @@ class PI0Pytorch(nn.Module):
         return time.to(dtype=torch.float32, device=device)
 
     def embed_prefix(
-        self, images, img_masks, lang_tokens, lang_masks
+        self, images, img_masks, lang_tokens, lang_masks, *, image_keys=None
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Embed images with SigLIP and language tokens with embedding layer to prepare
         for PaliGemma transformer processing.
+
+        When pooling is enabled, pass the tensors returned by `_preprocess_observation`
+        or supply the matching camera names in `image_keys`.
         """
         embs = []
         pad_masks = []
         att_masks = []
 
         # Process images
-        for img, img_mask in zip(images, img_masks, strict=True):
+        pooling = self.vision_token_pooling
+        cameras = zip(images, img_masks, strict=True)
+        if image_keys is None:
+            named_cameras = ((pair, None) for pair in cameras)
+        else:
+            named_cameras = zip(cameras, image_keys, strict=True)
+        for (img, img_mask), explicit_key in named_cameras:
+            camera_key = explicit_key
+            if pooling != "none" and camera_key is None:
+                camera_key = getattr(img, "_openpi_camera_key", None)
+                if camera_key is None:
+                    raise ValueError("Vision token pooling requires camera names from preprocessing or image_keys")
 
             def image_embed_func(img):
                 return self.paligemma_with_expert.embed_image(img)
 
             img_emb = self._apply_checkpoint(image_embed_func, img)
+
+            if pooling != "none" and camera_key == "base_0_rgb":
+                bsize, num_patches, embed_dim = img_emb.shape
+                if num_patches != 256:
+                    raise ValueError(f"Vision token pooling requires a 16x16 base grid, got {num_patches} tokens")
+                # The projected SigLIP patch grid is row-major. Reduce across horizontal pairs.
+                pairs = img_emb.reshape(bsize, 16, 8, 2, embed_dim)
+                pooled = pairs.mean(dim=3) if pooling == "avg" else pairs.amax(dim=3)
+                img_emb = pooled.reshape(bsize, 128, embed_dim)
 
             bsize, num_img_embs = img_emb.shape[:2]
 
@@ -316,7 +355,9 @@ class PI0Pytorch(nn.Module):
 
     def forward(self, observation, actions, noise=None, time=None) -> Tensor:
         """Do a full training forward pass and compute the loss (batch_size x num_steps x num_motors)"""
-        images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation, train=True)
+        images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(
+            observation, train=True, tag_camera_keys=False
+        )
 
         if noise is None:
             noise = self.sample_noise(actions.shape, actions.device)
@@ -328,7 +369,9 @@ class PI0Pytorch(nn.Module):
         x_t = time_expanded * noise + (1 - time_expanded) * actions
         u_t = noise - actions
 
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, lang_tokens, lang_masks)
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+            images, img_masks, lang_tokens, lang_masks, image_keys=_preprocessing.IMAGE_KEYS
+        )
         suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, x_t, time)
         if (
             self.paligemma_with_expert.paligemma.language_model.layers[0].self_attn.q_proj.weight.dtype
@@ -381,9 +424,13 @@ class PI0Pytorch(nn.Module):
             actions_shape = (bsize, self.config.action_horizon, self.config.action_dim)
             noise = self.sample_noise(actions_shape, device)
 
-        images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation, train=False)
+        images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(
+            observation, train=False, tag_camera_keys=False
+        )
 
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, lang_tokens, lang_masks)
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+            images, img_masks, lang_tokens, lang_masks, image_keys=_preprocessing.IMAGE_KEYS
+        )
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
 

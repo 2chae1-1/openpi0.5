@@ -1,5 +1,5 @@
 import dataclasses
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 import flax.nnx as nnx
 import jax
@@ -33,6 +33,8 @@ class Pi0Config(_model.BaseModelConfig):
     discrete_state_input: bool = None  # type: ignore
 
     pytorch_compile_mode: str | None = "max-autotune"
+    # PyTorch pi05 only: pool horizontal neighbors in the base camera's token grid.
+    vision_token_pooling: Literal["none", "avg", "max"] = "none"
 
     def __post_init__(self):
         if self.max_token_len is None:
