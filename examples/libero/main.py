@@ -1,8 +1,10 @@
 import collections
 import dataclasses
+import json
 import logging
 import math
 import pathlib
+from typing import Optional
 
 import imageio
 from libero.libero import benchmark
@@ -10,6 +12,7 @@ from libero.libero import get_libero_path
 from libero.libero.envs import OffScreenRenderEnv
 import numpy as np
 from openpi_client import image_tools
+from openpi_client import msgpack_numpy
 from openpi_client import websocket_client_policy as _websocket_client_policy
 import tqdm
 import tyro
@@ -44,8 +47,18 @@ class Args:
 
     seed: int = 7  # Random Seed (for reproducibility)
 
+    # Single-condition evaluation for the paired comparison.
+    task_id: Optional[int] = None
+    initial_state_id: Optional[int] = None
+    comparison_model: Optional[str] = None
+    capture_observation: Optional[pathlib.Path] = None
+
 
 def eval_libero(args: Args) -> None:
+    comparison = args.comparison_model is not None or args.capture_observation is not None
+    if comparison and (args.task_id is None or args.initial_state_id is None):
+        raise ValueError("A comparison requires both task_id and initial_state_id")
+
     # Set random seed
     np.random.seed(args.seed)
 
@@ -55,7 +68,8 @@ def eval_libero(args: Args) -> None:
     num_tasks_in_suite = task_suite.n_tasks
     logging.info(f"Task suite: {args.task_suite_name}")
 
-    pathlib.Path(args.video_out_path).mkdir(parents=True, exist_ok=True)
+    if not comparison:
+        pathlib.Path(args.video_out_path).mkdir(parents=True, exist_ok=True)
 
     if args.task_suite_name == "libero_spatial":
         max_steps = 220  # longest training demo has 193 steps
@@ -70,11 +84,18 @@ def eval_libero(args: Args) -> None:
     else:
         raise ValueError(f"Unknown task suite: {args.task_suite_name}")
 
-    client = _websocket_client_policy.WebsocketClientPolicy(args.host, args.port)
+    client = None
+    if args.capture_observation is None:
+        client = _websocket_client_policy.WebsocketClientPolicy(args.host, args.port)
+        if comparison and client.get_server_metadata().get("model") != args.comparison_model:
+            raise RuntimeError("Connected to the wrong comparison model")
 
     # Start evaluation
     total_episodes, total_successes = 0, 0
-    for task_id in tqdm.tqdm(range(num_tasks_in_suite)):
+    task_ids = range(num_tasks_in_suite) if args.task_id is None else [args.task_id]
+    for task_id in tqdm.tqdm(task_ids):
+        if not 0 <= task_id < num_tasks_in_suite:
+            raise ValueError(f"Invalid task ID: {task_id}")
         # Get task
         task = task_suite.get_task(task_id)
 
@@ -86,7 +107,10 @@ def eval_libero(args: Args) -> None:
 
         # Start episodes
         task_episodes, task_successes = 0, 0
-        for episode_idx in tqdm.tqdm(range(args.num_trials_per_task)):
+        episode_ids = range(args.num_trials_per_task) if args.initial_state_id is None else [args.initial_state_id]
+        for episode_idx in tqdm.tqdm(episode_ids):
+            if comparison and not 0 <= episode_idx < len(initial_states):
+                raise ValueError(f"Invalid initial state ID: {episode_idx}")
             logging.info(f"\nTask: {task_description}")
 
             # Reset environment
@@ -98,6 +122,7 @@ def eval_libero(args: Args) -> None:
 
             # Setup
             t = 0
+            done = False
             replay_images = []
 
             logging.info(f"Starting episode {task_episodes+1}...")
@@ -122,7 +147,8 @@ def eval_libero(args: Args) -> None:
                     )
 
                     # Save preprocessed image for replay video
-                    replay_images.append(img)
+                    if not comparison:
+                        replay_images.append(img)
 
                     if not action_plan:
                         # Finished executing previous action chunk -- compute new chunk
@@ -140,8 +166,17 @@ def eval_libero(args: Args) -> None:
                             "prompt": str(task_description),
                         }
 
+                        if args.capture_observation is not None:
+                            with args.capture_observation.open("xb") as stream:
+                                stream.write(msgpack_numpy.packb(element))
+                            env.close()
+                            return
+                        if comparison:
+                            element["benchmark_noise_seed"] = args.seed + (t - args.num_steps_wait) // args.replan_steps
                         # Query model to get action
                         action_chunk = client.infer(element)["actions"]
+                        if comparison and not np.isfinite(action_chunk).all():
+                            raise RuntimeError("Non-finite comparison action")
                         assert (
                             len(action_chunk) >= args.replan_steps
                         ), f"We want to replan every {args.replan_steps} steps, but policy only predicts {len(action_chunk)} steps."
@@ -158,11 +193,26 @@ def eval_libero(args: Args) -> None:
                     t += 1
 
                 except Exception as e:
+                    if comparison:
+                        raise
                     logging.error(f"Caught exception: {e}")
                     break
 
             task_episodes += 1
             total_episodes += 1
+
+            if comparison:
+                env.close()
+                print("ROLLOUT_RESULT " + json.dumps({
+                    "model": args.comparison_model,
+                    "suite": args.task_suite_name,
+                    "task_id": task_id,
+                    "initial_state_id": episode_idx,
+                    "seed": args.seed,
+                    "success": bool(done),
+                    "action_steps": min(t + 1, max_steps + args.num_steps_wait) - args.num_steps_wait,
+                }), flush=True)
+                return
 
             # Save a replay video of the episode
             suffix = "success" if done else "failure"
